@@ -40,6 +40,9 @@ PLAYER_NAME_CANDIDATES = ["player_name", "last_name, first_name", "name", "full_
 TEAM_ID_CANDIDATES = ["team_id", "team", "teamId"]
 
 TEAM_LOGO_URL = "https://www.mlbstatic.com/team-logos/{team_id}.svg"
+# ImageColumn only accepts "small" / "medium" / "large" -- there's no pixel-level
+# sizing knob in st.column_config. Change this to resize the logos.
+LOGO_COLUMN_WIDTH = "small"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
 
@@ -54,7 +57,12 @@ def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+# ttl=None -> cache never expires on its own. The only way data gets re-fetched
+# is (a) a brand new argument value (e.g. a season not seen yet) or (b) an
+# explicit st.cache_data.clear() call, which the "Force refresh" button below
+# triggers. This is what gives us "live on first load, static until the user
+# asks for a refresh" instead of a background/timed refresh.
+@st.cache_data(ttl=None, show_spinner=False)
 def fetch_csv(url: str) -> pd.DataFrame:
     resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.raise_for_status()
@@ -90,6 +98,10 @@ def normalize(df: pd.DataFrame, category: str) -> tuple[pd.DataFrame, dict]:
     return out.dropna(subset=["player_id"]), debug
 
 
+# Cached for the same reason as fetch_csv: the merge/aggregation work only
+# reruns when the underlying CSVs actually change (i.e. after a cache clear),
+# not on every Streamlit rerun (sorting, resizing, other widget interactions).
+@st.cache_data(ttl=None, show_spinner=False)
 def build_leaderboard(year: int):
     frames = {}
     debug_info = {}
@@ -177,7 +189,7 @@ with col1:
 with st.spinner("Pulling live data from Baseball Savant..."):
     leaderboard, debug_info = build_leaderboard(int(year))
 
-display_cols = ["team_logo", "player_name", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
+display_cols = ["player_name", "team_logo", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
 display_cols = [c for c in display_cols if c in leaderboard.columns]
 pretty_names = {
     "team_logo": "Team",
@@ -203,7 +215,7 @@ st.dataframe(
     use_container_width=True,
     height=700,
     column_config={
-        "Team": st.column_config.ImageColumn("Team", width="small"),
+        "Team": st.column_config.ImageColumn("Team", width=LOGO_COLUMN_WIDTH),
     },
 )
 
