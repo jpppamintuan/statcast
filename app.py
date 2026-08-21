@@ -27,7 +27,7 @@ st.set_page_config(page_title="Statcast Total Run Value Leaderboard", layout="wi
 SOURCES = {
     "batting": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Batter&type=All&sub_type=null&min=1&csv=true",
     "pitching": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Pitcher&type=All&sub_type=null&min=1&csv=true",
-    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?csv=true",
+    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?gameType=Regular&seasonStart={year}&seasonEnd={year}&type=fielder&position=0&minInnings=q&minResults=1&csv=true",
     "baserunning": "https://baseballsavant.mlb.com/leaderboard/baserunning-run-value?season_start={year}&season_end={year}&csv=true",
 }
 
@@ -39,7 +39,7 @@ RUN_VALUE_CANDIDATES = {
     "fielding": ["run_value", "fielding_run_value", "frv", "runs", "total_runs"],
     "baserunning": ["run_value", "baserunning_run_value", "runner_runs_tot", "runs"],
 }
-PLAYER_ID_CANDIDATES = ["player_id", "batter", "pitcher", "fielder_id", "runner_id", "mlbam_id"]
+PLAYER_ID_CANDIDATES = ["player_id", "batter", "pitcher", "fielder_id", "runner_id", "mlbam_id", "id"]
 PLAYER_NAME_CANDIDATES = ["player_name", "last_name, first_name", "name", "full_name", "entity_name", "last_name, first_name"]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
