@@ -25,22 +25,22 @@ st.set_page_config(page_title="Statcast Total Run Value Leaderboard", layout="wi
 # the leaderboard page in a browser, use its CSV/export link, and copy the
 # resulting URL here.
 SOURCES = {
-    "batting": "https://baseballsavant.mlb.com/leaderboard/statcast?type=batter&year={year}&position=&team=&min=1&csv=true",
-    "pitching": "https://baseballsavant.mlb.com/leaderboard/statcast?type=pitcher&year={year}&position=&team=&min=1&csv=true",
-    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?year={year}&csv=true",
+    "batting": "https://baseballsavant.mlb.com/leaderboard/swing-take?type=batter&year={year}&position=&team=&min=1&csv=true",
+    "pitching": "https://baseballsavant.mlb.com/leaderboard/swing-take?type=pitcher&year={year}&position=&team=&min=1&csv=true",
+    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?type=fielder&seasonStart={year}&seasonEnd={year}&csv=true",
     "baserunning": "https://baseballsavant.mlb.com/leaderboard/baserunning-run-value?season_start={year}&season_end={year}&csv=true",
 }
 
 # Candidate column names Savant has used for the run-value figure and player
 # identity on each leaderboard. The first match found in the fetched CSV wins.
 RUN_VALUE_CANDIDATES = {
-    "batting": ["run_value_batting", "runs_batting", "run_value", "batting_run_value"],
-    "pitching": ["run_value_pitching", "runs_pitching", "run_value", "pitching_run_value"],
-    "fielding": ["run_value", "fielding_run_value", "frv", "runs"],
+    "batting": ["run_value_batting", "runs_batting", "run_value", "batting_run_value", "runs_all"],
+    "pitching": ["run_value_pitching", "runs_pitching", "run_value", "pitching_run_value", "runs_all"],
+    "fielding": ["run_value", "fielding_run_value", "frv", "runs", "total_runs"],
     "baserunning": ["run_value", "baserunning_run_value", "runner_runs_tot", "runs"],
 }
 PLAYER_ID_CANDIDATES = ["player_id", "batter", "pitcher", "fielder_id", "runner_id", "mlbam_id"]
-PLAYER_NAME_CANDIDATES = ["player_name", "last_name, first_name", "name", "full_name"]
+PLAYER_NAME_CANDIDATES = ["player_name", "last_name, first_name", "name", "full_name", "entity_name"]
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
 
