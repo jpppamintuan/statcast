@@ -14,6 +14,7 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from io import StringIO
 
 st.set_page_config(page_title="Statcast Leaderboard", layout="wide")
@@ -90,6 +91,18 @@ TEAM_ID_TO_COLOR = {
     134: "#FDB827", 135: "#2F241D", 136: "#0C2C56", 137: "#FD5A1E", 138: "#C41E3A",
     139: "#092C5C", 140: "#003278", 141: "#134A8E", 142: "#002B5C", 143: "#E81828",
     144: "#CE1141", 145: "#27251F", 146: "#00A3E0", 147: "#132448", 158: "#12284B",
+}
+
+# Division groupings for the small-multiples layout. Order within each
+# division is alphabetized in code (not by this list order).
+DIVISION_ORDER = ["AL East", "AL Central", "AL West", "NL East", "NL Central", "NL West"]
+DIVISIONS = {
+    "AL East": ["BAL", "BOS", "NYY", "TB", "TOR"],
+    "AL Central": ["CWS", "CLE", "DET", "KC", "MIN"],
+    "AL West": ["HOU", "LAA", "OAK", "SEA", "TEX"],
+    "NL East": ["ATL", "MIA", "NYM", "PHI", "WSH"],
+    "NL Central": ["CHC", "CIN", "MIL", "PIT", "STL"],
+    "NL West": ["ARI", "COL", "LAD", "SD", "SF"],
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
@@ -280,17 +293,12 @@ def zebra_index_style(index_values) -> list[str]:
 
 
 def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
-    """One horizontal number line per team: x = pitching run value, dot size =
-    Games Started, dot color = team's primary color, label above each dot =
-    the pitcher's last name. Every team's line spans the same range
-    (league-wide min/max pitching RV among qualifying starters), so the lines
-    are directly comparable. Only pitchers with GS at least MIN_GS_PCT_OF_MAX
-    of the league's highest GS are shown.
-
-    Labels are placed as annotations (not marker text) so each one can get an
-    independent pixel-based vertical offset -- points that sit close together
-    on the same team's line get staggered to different heights instead of
-    stacking directly on top of each other."""
+    """Small multiples: one mini number-line subplot per team, arranged in a
+    grid grouped by division (rows) with teams alphabetized within each
+    division (columns). Every subplot shares the same x-axis range
+    (league-wide min/max pitching RV among qualifying starters), so line
+    lengths stay directly comparable across teams. Only pitchers with GS at
+    least MIN_GS_PCT_OF_MAX of the league's highest GS are shown."""
     league_max_gs = leaderboard["gs"].max()
     if pd.isna(league_max_gs) or league_max_gs <= 0:
         return None
@@ -312,71 +320,64 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     league_max = starters["pitching_rv"].max()
     pad = max((league_max - league_min) * 0.08, 1)
     x_range = [league_min - pad, league_max + pad]
-    x_span = x_range[1] - x_range[0]
 
-    min_size, max_size = 10, 32
-    # Points within this fraction of the total x-range are considered "close"
-    # and get staggered to a higher label level instead of overlapping.
-    collision_gap = x_span * 0.05
-    base_yshift, level_yshift = 12, 13
+    min_size, max_size = 8, 20
 
-    team_order = sorted(starters["team_abbr"].unique())
+    division_rows = [(div, sorted(DIVISIONS[div])) for div in DIVISION_ORDER]
+    subplot_titles = [team for _, teams in division_rows for team in teams]
 
-    fig = go.Figure()
-    for team in team_order:
-        team_df = starters[starters["team_abbr"] == team].sort_values("pitching_rv")
-        team_color = TEAM_ID_TO_COLOR.get(int(team_df["team_id"].iloc[0]), "#1f77b4")
+    fig = make_subplots(
+        rows=len(division_rows), cols=5,
+        row_titles=[div for div, _ in division_rows],
+        subplot_titles=subplot_titles,
+        shared_xaxes=True,
+        horizontal_spacing=0.015,
+        vertical_spacing=0.045,
+    )
 
-        # The number line itself.
-        fig.add_trace(go.Scatter(
-            x=x_range, y=[team, team],
-            mode="lines",
-            line=dict(color="rgba(150,150,150,0.4)", width=2),
-            hoverinfo="skip",
-            showlegend=False,
-        ))
+    for r, (_, teams) in enumerate(division_rows, start=1):
+        for c, team in enumerate(teams, start=1):
+            team_df = starters[starters["team_abbr"] == team].sort_values("pitching_rv")
+            team_ids = starters.loc[starters["team_abbr"] == team, "team_id"]
+            team_color = TEAM_ID_TO_COLOR.get(int(team_ids.iloc[0]), "#1f77b4") if not team_ids.empty else "#1f77b4"
 
-        # The starters on that line (markers only -- labels are annotations below).
-        sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
-        customdata = team_df[["team_abbr", "full_name", "gs"]].values
-        fig.add_trace(go.Scatter(
-            x=team_df["pitching_rv"], y=[team] * len(team_df),
-            mode="markers",
-            marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
-            customdata=customdata,
-            hovertemplate=(
-                "%{customdata[0]}<br>%{customdata[1]}<br>"
-                "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<extra></extra>"
-            ),
-            showlegend=False,
-        ))
+            fig.add_trace(go.Scatter(
+                x=x_range, y=[0, 0],
+                mode="lines",
+                line=dict(color="rgba(150,150,150,0.4)", width=2),
+                hoverinfo="skip",
+                showlegend=False,
+            ), row=r, col=c)
 
-        # Staggered labels: walk points left-to-right, bump the level whenever
-        # the next point is within collision_gap of the previous one, reset
-        # otherwise.
-        level = 0
-        prev_x = None
-        for _, prow in team_df.iterrows():
-            if prev_x is not None and (prow["pitching_rv"] - prev_x) < collision_gap:
-                level += 1
-            else:
-                level = 0
-            fig.add_annotation(
-                x=prow["pitching_rv"], y=team,
-                text=prow["last_name"],
-                showarrow=False,
-                yshift=base_yshift + level * level_yshift,
-                font=dict(size=10),
-            )
-            prev_x = prow["pitching_rv"]
+            if not team_df.empty:
+                sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
+                customdata = team_df[["team_abbr", "full_name", "gs"]].values
+                fig.add_trace(go.Scatter(
+                    x=team_df["pitching_rv"], y=[0] * len(team_df),
+                    mode="markers+text",
+                    text=team_df["last_name"],
+                    textposition="top center",
+                    textfont=dict(size=9),
+                    marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
+                    customdata=customdata,
+                    hovertemplate=(
+                        "%{customdata[0]}<br>%{customdata[1]}<br>"
+                        "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ), row=r, col=c)
+
+    fig.update_xaxes(range=x_range, showticklabels=False)
+    fig.update_xaxes(showticklabels=True, row=len(division_rows))
+    fig.update_xaxes(title_text="Pitching RV", row=len(division_rows), col=3)
+    fig.update_yaxes(showticklabels=False, zeroline=False, range=[-1, 1.8])
 
     fig.update_layout(
-        height=max(320, 34 * len(team_order) + 100),
-        margin=dict(l=60, r=30, t=30, b=40),
-        xaxis=dict(title="Pitching Run Value", range=x_range, zeroline=True),
-        yaxis=dict(title="", categoryorder="array", categoryarray=team_order[::-1]),
+        height=185 * len(division_rows) + 60,
+        margin=dict(l=90, r=30, t=40, b=40),
         plot_bgcolor="rgba(0,0,0,0)",
     )
+    fig.update_annotations(font_size=11)
     return fig
 
 
@@ -404,12 +405,14 @@ with btn_col1:
         type="primary" if st.session_state.view == "total_rv" else "secondary",
     ):
         st.session_state.view = "total_rv"
+        st.rerun()
 with btn_col2:
     if st.button(
         "Starting Pitchers", use_container_width=True,
         type="primary" if st.session_state.view == "starting_pitchers" else "secondary",
     ):
         st.session_state.view = "starting_pitchers"
+        st.rerun()
 
 if st.session_state.view == "total_rv":
     st.caption(
@@ -462,10 +465,11 @@ if st.session_state.view == "total_rv":
 
 else:
     st.caption(
-        "Each row is one team's starting rotation. Dot position = pitching run value "
-        "(lower to the left, higher to the right); dot size = Games Started; dot color = "
-        "team's primary color; every team's line spans the same league-wide min-to-max "
-        "range. Pitchers with fewer than 10% of the league's highest GS are excluded."
+        "One mini number line per team, grouped by division and alphabetized within "
+        "each division. Dot position = pitching run value (lower to the left, higher "
+        "to the right); dot size = Games Started; dot color = team's primary color; "
+        "every subplot spans the same league-wide min-to-max range. Pitchers with "
+        "fewer than 10% of the league's highest GS are excluded."
     )
     pitcher_chart = build_starting_pitcher_chart(leaderboard)
     if pitcher_chart is not None:
