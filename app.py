@@ -16,7 +16,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from io import StringIO
 
-st.set_page_config(page_title="Statcast Total Run Value Leaderboard", layout="wide")
+st.set_page_config(page_title="Statcast Leaderboard", layout="wide")
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -73,6 +73,23 @@ TEAM_ID_TO_ABBR = {
     120: "WSH", 121: "NYM", 133: "OAK", 134: "PIT", 135: "SD", 136: "SEA",
     137: "SF", 138: "STL", 139: "TB", 140: "TEX", 141: "TOR", 142: "MIN",
     143: "PHI", 144: "ATL", 145: "CWS", 146: "MIA", 147: "NYY", 158: "MIL",
+}
+
+# Best-effort official primary brand colors per team. These are hardcoded
+# rather than extracted from the logo SVGs at runtime -- pulling a "dominant
+# color" out of an image is unreliable (logos mix several colors, plus
+# transparency) and would need extra heavy dependencies (image rasterizing +
+# color-quantization libraries). A static, curated map is simpler and matches
+# each team's actual brand color more faithfully. Double-check any that look
+# off to you -- these are compiled from public team style guides, not verified
+# pixel-for-pixel against the current logo files.
+TEAM_ID_TO_COLOR = {
+    108: "#BA0021", 109: "#A71930", 110: "#DF4601", 111: "#BD3039", 112: "#0E3386",
+    113: "#C6011F", 114: "#0C2340", 115: "#333366", 116: "#0C2340", 117: "#002D62",
+    118: "#004687", 119: "#005A9C", 120: "#AB0003", 121: "#002D72", 133: "#003831",
+    134: "#FDB827", 135: "#2F241D", 136: "#0C2C56", 137: "#FD5A1E", 138: "#C41E3A",
+    139: "#092C5C", 140: "#003278", 141: "#134A8E", 142: "#002B5C", 143: "#E81828",
+    144: "#CE1141", 145: "#27251F", 146: "#00A3E0", 147: "#132448", 158: "#12284B",
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
@@ -264,10 +281,16 @@ def zebra_index_style(index_values) -> list[str]:
 
 def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     """One horizontal number line per team: x = pitching run value, dot size =
-    Games Started, label above each dot = the pitcher's last name. Every
-    team's line spans the same range (league-wide min/max pitching RV among
-    qualifying starters), so the lines are directly comparable. Only pitchers
-    with GS at least MIN_GS_PCT_OF_MAX of the league's highest GS are shown."""
+    Games Started, dot color = team's primary color, label above each dot =
+    the pitcher's last name. Every team's line spans the same range
+    (league-wide min/max pitching RV among qualifying starters), so the lines
+    are directly comparable. Only pitchers with GS at least MIN_GS_PCT_OF_MAX
+    of the league's highest GS are shown.
+
+    Labels are placed as annotations (not marker text) so each one can get an
+    independent pixel-based vertical offset -- points that sit close together
+    on the same team's line get staggered to different heights instead of
+    stacking directly on top of each other."""
     league_max_gs = leaderboard["gs"].max()
     if pd.isna(league_max_gs) or league_max_gs <= 0:
         return None
@@ -289,13 +312,20 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     league_max = starters["pitching_rv"].max()
     pad = max((league_max - league_min) * 0.08, 1)
     x_range = [league_min - pad, league_max + pad]
+    x_span = x_range[1] - x_range[0]
 
     min_size, max_size = 10, 32
+    # Points within this fraction of the total x-range are considered "close"
+    # and get staggered to a higher label level instead of overlapping.
+    collision_gap = x_span * 0.05
+    base_yshift, level_yshift = 12, 13
+
     team_order = sorted(starters["team_abbr"].unique())
 
     fig = go.Figure()
     for team in team_order:
         team_df = starters[starters["team_abbr"] == team].sort_values("pitching_rv")
+        team_color = TEAM_ID_TO_COLOR.get(int(team_df["team_id"].iloc[0]), "#1f77b4")
 
         # The number line itself.
         fig.add_trace(go.Scatter(
@@ -306,15 +336,13 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
             showlegend=False,
         ))
 
-        # The starters on that line.
+        # The starters on that line (markers only -- labels are annotations below).
         sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
         customdata = team_df[["team_abbr", "full_name", "gs"]].values
         fig.add_trace(go.Scatter(
             x=team_df["pitching_rv"], y=[team] * len(team_df),
-            mode="markers+text",
-            text=team_df["last_name"],
-            textposition="top center",
-            marker=dict(size=sizes, color="#1f77b4", line=dict(color="white", width=1)),
+            mode="markers",
+            marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
             customdata=customdata,
             hovertemplate=(
                 "%{customdata[0]}<br>%{customdata[1]}<br>"
@@ -322,6 +350,25 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
             ),
             showlegend=False,
         ))
+
+        # Staggered labels: walk points left-to-right, bump the level whenever
+        # the next point is within collision_gap of the previous one, reset
+        # otherwise.
+        level = 0
+        prev_x = None
+        for _, prow in team_df.iterrows():
+            if prev_x is not None and (prow["pitching_rv"] - prev_x) < collision_gap:
+                level += 1
+            else:
+                level = 0
+            fig.add_annotation(
+                x=prow["pitching_rv"], y=team,
+                text=prow["last_name"],
+                showarrow=False,
+                yshift=base_yshift + level * level_yshift,
+                font=dict(size=10),
+            )
+            prev_x = prow["pitching_rv"]
 
     fig.update_layout(
         height=max(320, 34 * len(team_order) + 100),
@@ -336,11 +383,7 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
-st.title("⚾ MLB Statcast Total Run Value Leaderboard")
-st.caption(
-    "Live from Baseball Savant. Total Run Value = Batting + Pitching + Fielding + Baserunning "
-    "run value, summed per player."
-)
+st.title("⚾ Statcast Leaderboard")
 
 col1, col2 = st.columns([1, 3])
 with col1:
@@ -351,64 +394,86 @@ with col1:
 with st.spinner("Pulling live data from Baseball Savant..."):
     leaderboard, debug_info = build_leaderboard(int(year))
 
-display_cols = ["player_name", "team_logo", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
-display_cols = [c for c in display_cols if c in leaderboard.columns]
-pretty_names = {
-    "team_logo": "Team",
-    "player_name": "Player",
-    "batting_rv": "Batting RV",
-    "pitching_rv": "Pitching RV",
-    "fielding_rv": "Fielding RV",
-    "baserunning_rv": "Baserunning RV",
-    "total_run_value": "Total Run Value",
-}
+if "view" not in st.session_state:
+    st.session_state.view = "total_rv"
 
-display_df = leaderboard[display_cols].rename(columns=pretty_names)
-rv_display_cols = [pretty_names[c] for c in RV_KEYS if pretty_names[c] in display_df.columns]
+btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+with btn_col1:
+    if st.button(
+        "Total RV", use_container_width=True,
+        type="primary" if st.session_state.view == "total_rv" else "secondary",
+    ):
+        st.session_state.view = "total_rv"
+with btn_col2:
+    if st.button(
+        "Starting Pitchers", use_container_width=True,
+        type="primary" if st.session_state.view == "starting_pitchers" else "secondary",
+    ):
+        st.session_state.view = "starting_pitchers"
 
-non_rv_cols = [c for c in display_df.columns if c not in rv_display_cols]
+if st.session_state.view == "total_rv":
+    st.caption(
+        "Live from Baseball Savant. Total Run Value = Batting + Pitching + Fielding + "
+        "Baserunning run value, summed per player."
+    )
 
-styled = (
-    display_df.style
-    .apply(zebra_column_style, axis=0, subset=non_rv_cols)
-    .apply(diverging_column_style, axis=0, subset=rv_display_cols)
-    .apply_index(zebra_index_style, axis=0)
-    .format({c: "{:.0f}" for c in rv_display_cols})
-)
+    display_cols = ["player_name", "team_logo", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
+    display_cols = [c for c in display_cols if c in leaderboard.columns]
+    pretty_names = {
+        "team_logo": "Team",
+        "player_name": "Player",
+        "batting_rv": "Batting RV",
+        "pitching_rv": "Pitching RV",
+        "fielding_rv": "Fielding RV",
+        "baserunning_rv": "Baserunning RV",
+        "total_run_value": "Total Run Value",
+    }
 
-# alignment="center"/"left" requires Streamlit >= 1.56. "Player" and the
-# rank/index column are left out on purpose to keep their current alignment.
-numeric_column_config = {
-    name: st.column_config.NumberColumn(name, alignment="center")
-    for name in rv_display_cols
-}
+    display_df = leaderboard[display_cols].rename(columns=pretty_names)
+    rv_display_cols = [pretty_names[c] for c in RV_KEYS if pretty_names[c] in display_df.columns]
 
-st.dataframe(
-    styled,
-    use_container_width=True,
-    height=700,
-    row_height=ROW_HEIGHT,
-    column_config={
-        "Team": st.column_config.ImageColumn("Team", width=LOGO_COLUMN_WIDTH, alignment="center"),
-        **numeric_column_config,
-    },
-)
+    non_rv_cols = [c for c in display_df.columns if c not in rv_display_cols]
+
+    styled = (
+        display_df.style
+        .apply(zebra_column_style, axis=0, subset=non_rv_cols)
+        .apply(diverging_column_style, axis=0, subset=rv_display_cols)
+        .apply_index(zebra_index_style, axis=0)
+        .format({c: "{:.0f}" for c in rv_display_cols})
+    )
+
+    # alignment="center"/"left" requires Streamlit >= 1.56. "Player" and the
+    # rank/index column are left out on purpose to keep their current alignment.
+    numeric_column_config = {
+        name: st.column_config.NumberColumn(name, alignment="center")
+        for name in rv_display_cols
+    }
+
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=700,
+        row_height=ROW_HEIGHT,
+        column_config={
+            "Team": st.column_config.ImageColumn("Team", width=LOGO_COLUMN_WIDTH, alignment="center"),
+            **numeric_column_config,
+        },
+    )
+
+else:
+    st.caption(
+        "Each row is one team's starting rotation. Dot position = pitching run value "
+        "(lower to the left, higher to the right); dot size = Games Started; dot color = "
+        "team's primary color; every team's line spans the same league-wide min-to-max "
+        "range. Pitchers with fewer than 10% of the league's highest GS are excluded."
+    )
+    pitcher_chart = build_starting_pitcher_chart(leaderboard)
+    if pitcher_chart is not None:
+        st.plotly_chart(pitcher_chart, use_container_width=True)
+    else:
+        st.info("No starting-pitcher data available for this season yet.")
 
 with st.expander("🔧 Debug: raw source status & column mapping (check this if numbers look off)"):
     for category, info in debug_info.items():
         st.markdown(f"**{category}**")
         st.json(info)
-
-st.divider()
-st.header("Starting Pitchers — Pitching Run Value by Team")
-st.caption(
-    "Each row is one team's starting rotation. Dot position = pitching run value "
-    "(lower to the left, higher to the right); dot size = Games Started; every "
-    "team's line spans the same league-wide min-to-max range. Pitchers with fewer "
-    "than 10% of the league's highest GS are excluded."
-)
-pitcher_chart = build_starting_pitcher_chart(leaderboard)
-if pitcher_chart is not None:
-    st.plotly_chart(pitcher_chart, use_container_width=True)
-else:
-    st.info("No starting-pitcher data available for this season yet.")
