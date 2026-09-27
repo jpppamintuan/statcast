@@ -9,6 +9,7 @@ Deploy target: Streamlit Community Cloud (free), source repo on GitHub.
 No local machine or scheduled job required -- every visit re-pulls fresh data.
 """
 
+import math
 import requests
 import pandas as pd
 import streamlit as st
@@ -22,7 +23,7 @@ st.set_page_config(page_title="Statcast Total Run Value Leaderboard", layout="wi
 # ----------------------------------------------------------------------------
 SOURCES = {
     "batting": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Batter&type=All&sub_type=null&min=1&csv=true",
-    "pitching": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Pitcher&type=All&sub_type=null&min=1&csv=true",
+    "pitching": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&group=Pitcher&type=All&sub_type=null&min=q&csv=true",
     "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?gameType=Regular&seasonStart={year}&seasonEnd={year}&type=fielder&position=0&minInnings=q&minResults=1&csv=true",
     "baserunning": "https://baseballsavant.mlb.com/leaderboard/baserunning-run-value?season_start={year}&season_end={year}&csv=true",
 }
@@ -56,10 +57,13 @@ ZEBRA_COLOR = "rgba(120,120,120,0.08)"
 # pulled separately from this custom leaderboard.
 STARTS_URL = (
     "https://baseballsavant.mlb.com/leaderboard/custom?year={year}&type=pitcher"
-    "&filter=&min=q&selections=p_starting_p&chart=false&x=&y=&r=no"
-    "&chartType=beeswarm&sort=1&sortDir=asc&csv=true"
+    "&filter=&min=1&selections=p_starting_p&chart=false&x=p_starting_p&y=p_starting_p"
+    "&r=no&chartType=beeswarm&sort=p_starting_p&sortDir=desc&csv=true"
 )
 GS_CANDIDATES = ["p_starting_p", "gs", "games_started", "starting_p"]
+# A pitcher needs at least this fraction of the league's highest GS to appear
+# on the chart (e.g. highest GS = 33 -> ceil(0.10 * 33) = 4 minimum).
+MIN_GS_PCT_OF_MAX = 0.10
 
 # Standard MLBAM team IDs (same IDs used for the team-logo URLs) mapped to
 # their abbreviation, for labeling the chart's per-team rows.
@@ -142,15 +146,24 @@ def normalize_starts(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return out.dropna(subset=["player_id"]), debug
 
 
-def get_last_name(full_name: str) -> str:
-    """Savant player names usually come as 'Last, First'; fall back to the
-    last whitespace-separated token for any other format."""
+def format_last_first(full_name: str) -> str:
+    """Normalize any player-name format to 'Last Name, First Name'."""
     if not isinstance(full_name, str) or not full_name.strip():
         return ""
-    if "," in full_name:
-        return full_name.split(",")[0].strip()
-    parts = full_name.strip().split()
-    return parts[-1] if parts else full_name
+    name = full_name.strip()
+    if "," in name:
+        last, _, first = name.partition(",")
+        return f"{last.strip()}, {first.strip()}" if first.strip() else last.strip()
+    parts = name.split()
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[-1]}, {' '.join(parts[:-1])}"
+
+
+def get_last_name(full_name: str) -> str:
+    """Just the last name, for the fixed point label above each dot."""
+    formatted = format_last_first(full_name)
+    return formatted.split(",")[0].strip() if formatted else ""
 
 
 # Cached for the same reason as fetch_csv: the merge/aggregation work only
@@ -253,12 +266,21 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     """One horizontal number line per team: x = pitching run value, dot size =
     Games Started, label above each dot = the pitcher's last name. Every
     team's line spans the same range (league-wide min/max pitching RV among
-    starters), so the lines are directly comparable."""
-    starters = leaderboard[(leaderboard["gs"] > 0) & leaderboard["team_id"].notna()].copy()
+    qualifying starters), so the lines are directly comparable. Only pitchers
+    with GS at least MIN_GS_PCT_OF_MAX of the league's highest GS are shown."""
+    league_max_gs = leaderboard["gs"].max()
+    if pd.isna(league_max_gs) or league_max_gs <= 0:
+        return None
+    min_gs_threshold = math.ceil(MIN_GS_PCT_OF_MAX * league_max_gs)
+
+    starters = leaderboard[
+        (leaderboard["gs"] >= min_gs_threshold) & leaderboard["team_id"].notna()
+    ].copy()
     if starters.empty:
         return None
 
     starters["last_name"] = starters["player_name"].apply(get_last_name)
+    starters["full_name"] = starters["player_name"].apply(format_last_first)
     starters["team_abbr"] = starters["team_id"].apply(
         lambda t: TEAM_ID_TO_ABBR.get(int(t), str(int(t)))
     )
@@ -268,9 +290,7 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     pad = max((league_max - league_min) * 0.08, 1)
     x_range = [league_min - pad, league_max + pad]
 
-    max_gs = max(starters["gs"].max(), 1)
     min_size, max_size = 10, 32
-
     team_order = sorted(starters["team_abbr"].unique())
 
     fig = go.Figure()
@@ -287,15 +307,19 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
         ))
 
         # The starters on that line.
-        sizes = min_size + (team_df["gs"] / max_gs) * (max_size - min_size)
+        sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
+        customdata = team_df[["team_abbr", "full_name", "gs"]].values
         fig.add_trace(go.Scatter(
             x=team_df["pitching_rv"], y=[team] * len(team_df),
             mode="markers+text",
             text=team_df["last_name"],
             textposition="top center",
             marker=dict(size=sizes, color="#1f77b4", line=dict(color="white", width=1)),
-            customdata=team_df["gs"],
-            hovertemplate="%{text}<br>Pitching RV: %{x:.0f}<br>GS: %{customdata:.0f}<extra></extra>",
+            customdata=customdata,
+            hovertemplate=(
+                "%{customdata[0]}<br>%{customdata[1]}<br>"
+                "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<extra></extra>"
+            ),
             showlegend=False,
         ))
 
@@ -380,7 +404,8 @@ st.header("Starting Pitchers — Pitching Run Value by Team")
 st.caption(
     "Each row is one team's starting rotation. Dot position = pitching run value "
     "(lower to the left, higher to the right); dot size = Games Started; every "
-    "team's line spans the same league-wide min-to-max range."
+    "team's line spans the same league-wide min-to-max range. Pitchers with fewer "
+    "than 10% of the league's highest GS are excluded."
 )
 pitcher_chart = build_starting_pitcher_chart(leaderboard)
 if pitcher_chart is not None:
