@@ -52,18 +52,35 @@ ROW_HEIGHT = 46  # default is 35px; raise this to make the logos bigger
 # Zebra-striping base color for even-numbered rows (odd rows stay transparent).
 ZEBRA_COLOR = "rgba(120,120,120,0.08)"
 
-# --- Starting-pitcher chart config ---------------------------------------
-# Games Started (GS) isn't on the pitching run-value leaderboard, so it's
-# pulled separately from this custom leaderboard.
+# --- Pitchers feature config ---------------------------------------------
+# Games Started (GS) and Innings Pitched (IP) aren't on the pitching run-value
+# leaderboard, so they're pulled separately from this custom leaderboard.
 STARTS_URL = (
     "https://baseballsavant.mlb.com/leaderboard/custom?year={year}&type=pitcher"
-    "&filter=&min=1&selections=p_starting_p&chart=false&x=p_starting_p&y=p_starting_p"
-    "&r=no&chartType=beeswarm&sort=p_starting_p&sortDir=desc&csv=true"
+    "&filter=&min=1&selections=p_formatted_ip%2Cp_starting_p&chart=false"
+    "&x=p_starting_p&y=p_starting_p&r=no&chartType=beeswarm&sort=p_starting_p"
+    "&sortDir=desc&csv=true"
 )
 GS_CANDIDATES = ["p_starting_p", "gs", "games_started", "starting_p"]
-# A pitcher needs at least this fraction of the league's highest GS to appear
-# on the chart (e.g. highest GS = 33 -> ceil(0.10 * 33) = 4 minimum).
+# Savant's "formatted IP" uses baseball's innings notation (X.0/X.1/X.2 for
+# outs, not literal tenths -- e.g. 45.2 means 45 and 2/3 innings). That still
+# sorts and thresholds correctly as a plain float compare (any X.0/X.1/X.2
+# always falls between X and X+1), so no unit conversion is needed for a
+# ">=" filter like the reliever IP minimum below.
+IP_CANDIDATES = ["p_formatted_ip", "ip", "innings_pitched"]
+
+# A pitcher needs at least this fraction of the league's highest GS to count
+# as a starter (e.g. highest GS = 33 -> ceil(0.10 * 33) = 4 minimum). Below
+# that, they're a reliever candidate -- and also need at least this many
+# innings pitched to show up on the Relievers chart.
 MIN_GS_PCT_OF_MAX = 0.10
+MIN_RELIEVER_IP = 16.2
+
+# Starters use context-neutral pitching run value; relievers use
+# leverage-based (weighted by game situation), since a reliever's value is
+# concentrated in high-leverage spots that context-neutral RV would flatten out.
+PITCHERS_NEUTRAL_RV_URL = "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Pitcher&type=All&sub_type=null&min=10&csv=true"
+PITCHERS_LEVERAGED_RV_URL = "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Leveraged&group=Pitcher&type=All&sub_type=null&min=10&csv=true"
 
 # Standard MLBAM team IDs (same IDs used for the team-logo URLs) mapped to
 # their abbreviation, for labeling the chart's per-team rows.
@@ -159,18 +176,20 @@ def normalize(df: pd.DataFrame, category: str) -> tuple[pd.DataFrame, dict]:
 
 
 def normalize_starts(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Reduce the custom GS leaderboard CSV down to [player_id, gs]."""
+    """Reduce the custom GS/IP leaderboard CSV down to [player_id, gs, ip]."""
     debug = {"columns_found": list(df.columns), "rows": len(df)}
     id_col = pick_col(df, PLAYER_ID_CANDIDATES)
     gs_col = pick_col(df, GS_CANDIDATES)
-    debug.update({"id_col_used": id_col, "gs_col_used": gs_col})
+    ip_col = pick_col(df, IP_CANDIDATES)
+    debug.update({"id_col_used": id_col, "gs_col_used": gs_col, "ip_col_used": ip_col})
 
     if id_col is None or gs_col is None:
-        return pd.DataFrame(columns=["player_id", "gs"]), debug
+        return pd.DataFrame(columns=["player_id", "gs", "ip"]), debug
 
     out = pd.DataFrame({
         "player_id": df[id_col],
         "gs": pd.to_numeric(df[gs_col], errors="coerce"),
+        "ip": pd.to_numeric(df[ip_col], errors="coerce") if ip_col else pd.NA,
     })
     return out.dropna(subset=["player_id"]), debug
 
@@ -241,21 +260,45 @@ def build_leaderboard(year: int):
         lambda t: TEAM_LOGO_URL.format(team_id=int(t)) if pd.notna(t) else None
     )
 
-    # Games Started -- separate source, only used by the starting-pitcher chart.
-    try:
-        starts_raw = fetch_csv(STARTS_URL.format(year=year))
-        starts_norm, starts_debug = normalize_starts(starts_raw)
-        debug_info["starts"] = {"status": "ok", "url": STARTS_URL.format(year=year), **starts_debug}
-    except Exception as e:
-        starts_norm = pd.DataFrame(columns=["player_id", "gs"])
-        debug_info["starts"] = {"status": f"error: {e}", "url": STARTS_URL.format(year=year)}
-
-    combined = combined.merge(starts_norm, on="player_id", how="left")
-    combined["gs"] = combined["gs"].fillna(0)
-
     combined = combined.sort_values("total_run_value", ascending=False).reset_index(drop=True)
     combined.index += 1
     return combined, debug_info
+
+
+# Cached the same way as build_leaderboard -- fetched once, held until a
+# manual refresh. Returns {"neutral": df, "leveraged": df}, each with
+# [player_id, player_name, team_id, pitching_rv, gs, ip]. The GS/IP source is
+# shared between both; only the run-value source (and its leverage setting)
+# differs.
+@st.cache_data(ttl=None, show_spinner=False)
+def build_pitchers_data(year: int):
+    debug_info = {}
+
+    try:
+        starts_raw = fetch_csv(STARTS_URL.format(year=year))
+        starts_norm, starts_debug = normalize_starts(starts_raw)
+        debug_info["pitchers_gs_ip"] = {"status": "ok", "url": STARTS_URL.format(year=year), **starts_debug}
+    except Exception as e:
+        starts_norm = pd.DataFrame(columns=["player_id", "gs", "ip"])
+        debug_info["pitchers_gs_ip"] = {"status": f"error: {e}", "url": STARTS_URL.format(year=year)}
+
+    datasets = {}
+    for mode, url_template in [("neutral", PITCHERS_NEUTRAL_RV_URL), ("leveraged", PITCHERS_LEVERAGED_RV_URL)]:
+        url = url_template.format(year=year)
+        try:
+            raw = fetch_csv(url)
+            norm, debug = normalize(raw, "pitching")
+            debug_info[f"pitchers_rv_{mode}"] = {"status": "ok", "url": url, **debug}
+        except Exception as e:
+            norm = pd.DataFrame(columns=["player_id", "player_name", "team_id", "pitching_rv"])
+            debug_info[f"pitchers_rv_{mode}"] = {"status": f"error: {e}", "url": url}
+
+        merged = norm.merge(starts_norm, on="player_id", how="left")
+        merged["gs"] = merged["gs"].fillna(0)
+        merged["ip"] = merged["ip"].fillna(0)
+        datasets[mode] = merged
+
+    return datasets, debug_info
 
 
 def diverging_column_style(col: pd.Series) -> list[str]:
@@ -291,34 +334,31 @@ def zebra_index_style(index_values) -> list[str]:
     return [f"background-color: {ZEBRA_COLOR if i % 2 == 0 else 'transparent'}" for i in index_values]
 
 
-def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
+def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figure | None:
     """One full-width horizontal number line per team (stacked vertically, one
     row per team), grouped by division with extra blank spacing between
     divisions and teams alphabetized within each division. Every line shares
-    the same x-axis range (league-wide min/max pitching RV among qualifying
-    starters), so lengths stay directly comparable. Labels alternate above/
-    below their point when consecutive points on the same line sit close
-    enough to collide. Only pitchers with GS at least MIN_GS_PCT_OF_MAX of
-    the league's highest GS are shown."""
-    league_max_gs = leaderboard["gs"].max()
-    if pd.isna(league_max_gs) or league_max_gs <= 0:
-        return None
-    min_gs_threshold = math.ceil(MIN_GS_PCT_OF_MAX * league_max_gs)
-
-    starters = leaderboard[
-        (leaderboard["gs"] >= min_gs_threshold) & leaderboard["team_id"].notna()
-    ].copy()
-    if starters.empty:
+    the same x-axis range (min/max pitching RV across the given subset), so
+    lengths stay directly comparable. Labels alternate above/below their
+    point when consecutive points on the same line sit close enough to
+    collide. `subset` is expected to already be filtered to the pitchers
+    that should appear (Starters or Relievers) -- this function just draws it."""
+    subset = subset[subset["team_id"].notna()].copy()
+    if subset.empty:
         return None
 
-    starters["last_name"] = starters["player_name"].apply(get_last_name)
-    starters["full_name"] = starters["player_name"].apply(format_last_first)
-    starters["team_abbr"] = starters["team_id"].apply(
+    subset["last_name"] = subset["player_name"].apply(get_last_name)
+    subset["full_name"] = subset["player_name"].apply(format_last_first)
+    subset["team_abbr"] = subset["team_id"].apply(
         lambda t: TEAM_ID_TO_ABBR.get(int(t), str(int(t)))
     )
+    # Local max GS (within this subset) drives marker sizing, so starters and
+    # relievers each get a meaningful size spread rather than relievers all
+    # rendering tiny against a starter-scale maximum.
+    local_max_gs = max(subset["gs"].max(), 1)
 
-    league_min = starters["pitching_rv"].min()
-    league_max = starters["pitching_rv"].max()
+    league_min = subset["pitching_rv"].min()
+    league_max = subset["pitching_rv"].max()
     pad = max((league_max - league_min) * 0.08, 1)
     x_range = [league_min - pad, league_max + pad]
 
@@ -347,8 +387,8 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     for division in DIVISION_ORDER:
         teams = sorted(DIVISIONS[division])
         for team in teams:
-            team_df = starters[starters["team_abbr"] == team].sort_values("pitching_rv")
-            team_ids = starters.loc[starters["team_abbr"] == team, "team_id"]
+            team_df = subset[subset["team_abbr"] == team].sort_values("pitching_rv")
+            team_ids = subset.loc[subset["team_abbr"] == team, "team_id"]
             team_color = TEAM_ID_TO_COLOR.get(int(team_ids.iloc[0]), "#1f77b4") if not team_ids.empty else "#1f77b4"
 
             fig.add_trace(go.Scatter(
@@ -360,7 +400,7 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
             ))
 
             if not team_df.empty:
-                sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
+                sizes = min_size + (team_df["gs"] / local_max_gs) * (max_size - min_size)
                 customdata = team_df[["team_abbr", "full_name", "gs"]].values
 
                 # Alternate top/bottom placement whenever consecutive points
@@ -405,7 +445,7 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     fig.update_layout(
         height=max(400, ROW_PX * len(y_categories) + 120),
         margin=dict(l=170, r=30, t=30, b=40),
-        xaxis=dict(title="Pitching Run Value", range=x_range, zeroline=True),
+        xaxis=dict(title=x_axis_title, range=x_range, zeroline=True),
         yaxis=dict(
             title="",
             tickmode="array",
@@ -446,7 +486,7 @@ with btn_col1:
         st.rerun()
 with btn_col2:
     if st.button(
-        "Starting Pitchers", use_container_width=True,
+        "Pitchers", use_container_width=True,
         type="primary" if st.session_state.view == "starting_pitchers" else "secondary",
     ):
         st.session_state.view = "starting_pitchers"
@@ -501,23 +541,69 @@ if st.session_state.view == "total_rv":
         },
     )
 
+    debug_to_show = debug_info
+
 else:
+    with st.spinner("Pulling live pitcher data from Baseball Savant..."):
+        pitchers_data, pitchers_debug = build_pitchers_data(int(year))
+
+    if "pitcher_subview" not in st.session_state:
+        st.session_state.pitcher_subview = "starters"
+
+    sub_col1, sub_col2, _ = st.columns([1, 1, 4])
+    with sub_col1:
+        if st.button(
+            "Starters", use_container_width=True,
+            type="primary" if st.session_state.pitcher_subview == "starters" else "secondary",
+        ):
+            st.session_state.pitcher_subview = "starters"
+            st.rerun()
+    with sub_col2:
+        if st.button(
+            "Relievers", use_container_width=True,
+            type="primary" if st.session_state.pitcher_subview == "relievers" else "secondary",
+        ):
+            st.session_state.pitcher_subview = "relievers"
+            st.rerun()
+
+    league_max_gs = pitchers_data["neutral"]["gs"].max()
+    min_gs_threshold = math.ceil(MIN_GS_PCT_OF_MAX * league_max_gs) if pd.notna(league_max_gs) and league_max_gs > 0 else 0
+
+    if st.session_state.pitcher_subview == "starters":
+        subset = pitchers_data["neutral"]
+        subset = subset[subset["gs"] >= min_gs_threshold]
+        x_axis_title = "Pitching Run Value (Context-Neutral)"
+        st.caption(
+            "Starters: pitchers with GS at least 10% of the league's highest GS "
+            f"(currently {min_gs_threshold}+). Scored with **context-neutral** run value."
+        )
+    else:
+        subset = pitchers_data["leveraged"]
+        subset = subset[(subset["gs"] < min_gs_threshold) & (subset["ip"] >= MIN_RELIEVER_IP)]
+        x_axis_title = "Pitching Run Value (Leverage-Based)"
+        st.caption(
+            f"Relievers: pitchers with GS below the starter threshold and at least "
+            f"{MIN_RELIEVER_IP} IP. Scored with **leverage-based** run value "
+            "(weighted by game situation), not context-neutral."
+        )
+
     st.caption(
         "One full-width line per team, grouped by division (with extra spacing "
         "between divisions) and alphabetized within each division. Dot position = "
-        "pitching run value (lower to the left, higher to the right); dot size = "
-        "Games Started; dot color = team's primary color; every line spans the same "
-        "league-wide min-to-max range. Labels flip above/below their point when two "
-        "on the same line sit close together. Pitchers with fewer than 10% of the "
-        "league's highest GS are excluded."
+        "run value (lower to the left, higher to the right); dot size = Games "
+        "Started; dot color = team's primary color; every line spans the same "
+        "min-to-max range. Labels flip above/below their point when two on the "
+        "same line sit close together."
     )
-    pitcher_chart = build_starting_pitcher_chart(leaderboard)
+    pitcher_chart = build_pitcher_line_chart(subset, x_axis_title)
     if pitcher_chart is not None:
         st.plotly_chart(pitcher_chart, use_container_width=True)
     else:
-        st.info("No starting-pitcher data available for this season yet.")
+        st.info("No pitcher data available for this season/selection yet.")
+
+    debug_to_show = {**debug_info, **pitchers_debug}
 
 with st.expander("🔧 Debug: raw source status & column mapping (check this if numbers look off)"):
-    for category, info in debug_info.items():
+    for category, info in debug_to_show.items():
         st.markdown(f"**{category}**")
         st.json(info)
