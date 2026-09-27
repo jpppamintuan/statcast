@@ -40,9 +40,15 @@ PLAYER_NAME_CANDIDATES = ["player_name", "last_name, first_name", "name", "full_
 TEAM_ID_CANDIDATES = ["team_id", "team", "teamId"]
 
 TEAM_LOGO_URL = "https://www.mlbstatic.com/team-logos/{team_id}.svg"
-# ImageColumn only accepts "small" / "medium" / "large" -- there's no pixel-level
-# sizing knob in st.column_config. Change this to resize the logos.
+# ImageColumn only accepts "small" / "medium" / "large" for column *width* --
+# there's no pixel-level width knob. The logo's actual rendered size is driven
+# by ROW_HEIGHT below (the image scales to fill the row vertically, so a
+# taller row = a bigger logo). Requires Streamlit >= 1.43.
 LOGO_COLUMN_WIDTH = "small"
+ROW_HEIGHT = 46  # default is 35px; raise this to make the logos bigger
+
+# Zebra-striping base color for even-numbered rows (odd rows stay transparent).
+ZEBRA_COLOR = "rgba(120,120,120,0.08)"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
 
@@ -149,10 +155,11 @@ def build_leaderboard(year: int):
     return combined, debug_info
 
 
-def statcast_diverging_style(row: pd.Series) -> list[str]:
-    """Statcast-portal style coloring: red on the row's highest value, blue on the
-    row's lowest, no fill at 0, with intermediate values shaded proportionally."""
-    vals = row.astype(float)
+def diverging_column_style(col: pd.Series) -> list[str]:
+    """Statcast-portal style coloring, scaled per column (i.e. per run-value
+    category) across all players: red = that column's highest value, blue =
+    that column's lowest, no fill at 0, intermediate values shaded proportionally."""
+    vals = col.astype(float)
     max_abs = vals.abs().max()
     if pd.isna(max_abs) or max_abs == 0:
         max_abs = 1
@@ -169,6 +176,16 @@ def statcast_diverging_style(row: pd.Series) -> list[str]:
             alpha = 0.15 + 0.65 * intensity
             styles.append(f"background-color: rgba(31,119,180,{alpha:.2f})")  # blue
     return styles
+
+
+def zebra_column_style(col: pd.Series) -> list[str]:
+    """Zebra-stripe a non-run-value column by row position."""
+    return [f"background-color: {ZEBRA_COLOR if i % 2 == 0 else 'transparent'}" for i in col.index]
+
+
+def zebra_index_style(index_values) -> list[str]:
+    """Stripe the rank/index column to match its row."""
+    return [f"background-color: {ZEBRA_COLOR if i % 2 == 0 else 'transparent'}" for i in index_values]
 
 
 # ----------------------------------------------------------------------------
@@ -204,18 +221,31 @@ pretty_names = {
 display_df = leaderboard[display_cols].rename(columns=pretty_names)
 rv_display_cols = [pretty_names[c] for c in RV_KEYS if pretty_names[c] in display_df.columns]
 
+non_rv_cols = [c for c in display_df.columns if c not in rv_display_cols]
+
 styled = (
     display_df.style
-    .apply(statcast_diverging_style, axis=1, subset=rv_display_cols)
+    .apply(zebra_column_style, axis=0, subset=non_rv_cols)
+    .apply(diverging_column_style, axis=0, subset=rv_display_cols)
+    .apply_index(zebra_index_style, axis=0)
     .format({c: "{:.0f}" for c in rv_display_cols})
 )
+
+# alignment="center"/"left" requires Streamlit >= 1.56. "Player" and the
+# rank/index column are left out on purpose to keep their current alignment.
+numeric_column_config = {
+    name: st.column_config.NumberColumn(name, alignment="center")
+    for name in rv_display_cols
+}
 
 st.dataframe(
     styled,
     use_container_width=True,
     height=700,
+    row_height=ROW_HEIGHT,
     column_config={
-        "Team": st.column_config.ImageColumn("Team", width=LOGO_COLUMN_WIDTH),
+        "Team": st.column_config.ImageColumn("Team", width=LOGO_COLUMN_WIDTH, alignment="center"),
+        **numeric_column_config,
     },
 )
 
