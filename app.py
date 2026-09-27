@@ -334,7 +334,7 @@ def zebra_index_style(index_values) -> list[str]:
     return [f"background-color: {ZEBRA_COLOR if i % 2 == 0 else 'transparent'}" for i in index_values]
 
 
-def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figure | None:
+def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str, show_gs_in_tooltip: bool) -> go.Figure | None:
     """One full-width horizontal number line per team (stacked vertically, one
     row per team), grouped by division with extra blank spacing between
     divisions and teams alphabetized within each division. Every line shares
@@ -342,7 +342,10 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
     lengths stay directly comparable. Labels alternate above/below their
     point when consecutive points on the same line sit close enough to
     collide. `subset` is expected to already be filtered to the pitchers
-    that should appear (Starters or Relievers) -- this function just draws it."""
+    that should appear (Starters or Relievers) -- this function just draws it.
+    Point size is driven by IP. The tooltip always shows IP; GS is added too
+    only when show_gs_in_tooltip is True (starters), since it's ~0 and not
+    meaningful for relievers."""
     subset = subset[subset["team_id"].notna()].copy()
     if subset.empty:
         return None
@@ -352,10 +355,10 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
     subset["team_abbr"] = subset["team_id"].apply(
         lambda t: TEAM_ID_TO_ABBR.get(int(t), str(int(t)))
     )
-    # Local max GS (within this subset) drives marker sizing, so starters and
-    # relievers each get a meaningful size spread rather than relievers all
-    # rendering tiny against a starter-scale maximum.
-    local_max_gs = max(subset["gs"].max(), 1)
+    # Local max IP (within this subset) drives marker sizing, so starters and
+    # relievers each get a meaningful size spread rather than one group
+    # rendering tiny against the other group's scale.
+    local_max_ip = max(subset["ip"].max(), 1)
 
     league_min = subset["pitching_rv"].min()
     league_max = subset["pitching_rv"].max()
@@ -383,6 +386,19 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
                 y_categories.append(f"__gap_{i}_{g}__")
                 tick_text.append("")
 
+    if show_gs_in_tooltip:
+        customdata_cols = ["team_abbr", "full_name", "gs", "ip"]
+        hovertemplate = (
+            "%{customdata[0]}<br>%{customdata[1]}<br>"
+            "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<br>IP: %{customdata[3]:.1f}<extra></extra>"
+        )
+    else:
+        customdata_cols = ["team_abbr", "full_name", "ip"]
+        hovertemplate = (
+            "%{customdata[0]}<br>%{customdata[1]}<br>"
+            "Pitching RV: %{x:.0f}<br>IP: %{customdata[2]:.1f}<extra></extra>"
+        )
+
     fig = go.Figure()
     for division in DIVISION_ORDER:
         teams = sorted(DIVISIONS[division])
@@ -400,8 +416,8 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
             ))
 
             if not team_df.empty:
-                sizes = min_size + (team_df["gs"] / local_max_gs) * (max_size - min_size)
-                customdata = team_df[["team_abbr", "full_name", "gs"]].values
+                sizes = min_size + (team_df["ip"] / local_max_ip) * (max_size - min_size)
+                customdata = team_df[customdata_cols].values
 
                 # Alternate top/bottom placement whenever consecutive points
                 # (sorted left to right) are close enough to collide.
@@ -423,10 +439,7 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
                     textfont=dict(size=10),
                     marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
                     customdata=customdata,
-                    hovertemplate=(
-                        "%{customdata[0]}<br>%{customdata[1]}<br>"
-                        "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<extra></extra>"
-                    ),
+                    hovertemplate=hovertemplate,
                     showlegend=False,
                 ))
 
@@ -445,7 +458,7 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
     fig.update_layout(
         height=max(400, ROW_PX * len(y_categories) + 120),
         margin=dict(l=170, r=30, t=30, b=40),
-        xaxis=dict(title=x_axis_title, range=x_range, zeroline=True),
+        xaxis=dict(title=x_axis_title, range=x_range, zeroline=True, fixedrange=True),
         yaxis=dict(
             title="",
             tickmode="array",
@@ -453,8 +466,10 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str) -> go.Figu
             ticktext=tick_text,
             categoryorder="array",
             categoryarray=y_categories[::-1],
+            fixedrange=True,
         ),
         plot_bgcolor="rgba(0,0,0,0)",
+        dragmode=False,
     )
     return fig
 
@@ -590,14 +605,20 @@ else:
     st.caption(
         "One full-width line per team, grouped by division (with extra spacing "
         "between divisions) and alphabetized within each division. Dot position = "
-        "run value (lower to the left, higher to the right); dot size = Games "
-        "Started; dot color = team's primary color; every line spans the same "
+        "run value (lower to the left, higher to the right); dot size = Innings "
+        "Pitched; dot color = team's primary color; every line spans the same "
         "min-to-max range. Labels flip above/below their point when two on the "
         "same line sit close together."
     )
-    pitcher_chart = build_pitcher_line_chart(subset, x_axis_title)
+    pitcher_chart = build_pitcher_line_chart(
+        subset, x_axis_title,
+        show_gs_in_tooltip=(st.session_state.pitcher_subview == "starters"),
+    )
     if pitcher_chart is not None:
-        st.plotly_chart(pitcher_chart, use_container_width=True)
+        st.plotly_chart(
+            pitcher_chart, use_container_width=True,
+            config={"displayModeBar": False, "scrollZoom": False, "doubleClick": False},
+        )
     else:
         st.info("No pitcher data available for this season/selection yet.")
 
