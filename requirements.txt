@@ -1,3 +1,4 @@
-streamlit>=1.36
+streamlit>=1.56  # needed for column_config alignment (1.56) and row_height (1.43)
 pandas>=2.0
 requests>=2.31
+plotly>=5.20
