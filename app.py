@@ -59,6 +59,17 @@ ZEBRA_COLOR = "rgba(120,120,120,0.08)"
 # inside its own container instead of squishing labels and points together.
 CHART_FIXED_WIDTH = 1300
 
+# Streamlit's default theme font is "Source Sans" (branded "Source Sans Pro"
+# in most tooling, renamed "Source Sans 3" in its current Google Fonts
+# release) -- match it so the chart's text doesn't look like a different app.
+# This has to be set explicitly rather than inherited: the chart is embedded
+# via components.html, which renders in its own iframe and does NOT pick up
+# the parent page's theme CSS (font included) -- a known Streamlit limitation
+# (streamlit/streamlit#10660), not something fixable from our side via CSS.
+# The <link> tags in render_scrollable_chart() load the actual font file
+# inside that iframe; this family stack is what Plotly is told to use.
+FONT_FAMILY = '"Source Sans Pro", "Source Sans 3", sans-serif'
+
 # --- Pitchers feature config ---------------------------------------------
 # Games Started (GS) and Innings Pitched (IP) aren't on the pitching run-value
 # leaderboard, so they're pulled separately from this custom leaderboard.
@@ -443,7 +454,7 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str, show_gs_in
                     mode="markers+text",
                     text=team_df["last_name"],
                     textposition=text_positions,
-                    textfont=dict(size=10),
+                    textfont=dict(size=10, family=FONT_FAMILY),
                     marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
                     customdata=customdata,
                     hovertemplate=hovertemplate,
@@ -458,13 +469,14 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str, show_gs_in
             yref="y", y=mid_team,
             text=f"<b>{division}</b>",
             showarrow=False,
-            font=dict(size=12, color="gray"),
+            font=dict(size=12, color="gray", family=FONT_FAMILY),
         )
 
     ROW_PX = 60
     fig.update_layout(
         height=max(400, ROW_PX * len(y_categories) + 120),
         margin=dict(l=170, r=30, t=30, b=40),
+        font=dict(family=FONT_FAMILY),
         xaxis=dict(title=x_axis_title, range=x_range, zeroline=True, fixedrange=True),
         yaxis=dict(
             title="",
@@ -477,6 +489,7 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str, show_gs_in
         ),
         plot_bgcolor="rgba(0,0,0,0)",
         dragmode=False,
+        hoverlabel=dict(font=dict(family=FONT_FAMILY)),
     )
     return fig
 
@@ -499,8 +512,20 @@ def render_scrollable_chart(fig: go.Figure) -> None:
         full_html=False,
         config={"displayModeBar": False, "scrollZoom": False, "doubleClick": False},
     )
+    # This iframe is a separate document from the main Streamlit page, so it
+    # doesn't have Streamlit's "Source Sans" font file loaded -- fig.font
+    # naming the right family isn't enough on its own, the actual font has
+    # to be fetched here too, or it silently falls back to a generic
+    # sans-serif that merely resembles it.
+    font_link_tags = (
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,300..900;1,300..900&display=swap" rel="stylesheet">'
+        '<link href="https://fonts.googleapis.com/css2?family=Source+Sans+Pro:ital,wght@0,300;0,400;0,600;0,700;0,900;1,400&display=swap" rel="stylesheet">'
+    )
     wrapped_html = f"""
-    <div style="overflow-x:auto; -webkit-overflow-scrolling:touch;">
+    {font_link_tags}
+    <div style="overflow-x:auto; -webkit-overflow-scrolling:touch; font-family:{FONT_FAMILY};">
         <div style="width:{CHART_FIXED_WIDTH}px;">
             {chart_html}
         </div>
