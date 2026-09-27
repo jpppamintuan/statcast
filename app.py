@@ -622,29 +622,24 @@ else:
     with st.spinner("Pulling live pitcher data from Baseball Savant..."):
         pitchers_data, pitchers_debug = build_pitchers_data(int(year))
 
-    if "pitcher_subview" not in st.session_state:
-        st.session_state.pitcher_subview = "starters"
-
-    sub_col1, sub_col2, _ = st.columns([1, 1, 4])
-    with sub_col1:
-        if st.button(
-            "Starters", use_container_width=True,
-            type="primary" if st.session_state.pitcher_subview == "starters" else "secondary",
-        ):
-            st.session_state.pitcher_subview = "starters"
-            st.rerun()
-    with sub_col2:
-        if st.button(
-            "Relievers", use_container_width=True,
-            type="primary" if st.session_state.pitcher_subview == "relievers" else "secondary",
-        ):
-            st.session_state.pitcher_subview = "relievers"
-            st.rerun()
+    # st.segmented_control renders as one connected pill (rounded outer
+    # corners, square divider in the middle) rather than two separate
+    # buttons -- visually reads as "an option within Pitchers" instead of
+    # a third top-level tab, unlike the Total RV / Pitchers buttons above.
+    sub_view = st.segmented_control(
+        "Pitcher type",
+        options=["Starters", "Relievers"],
+        default="Starters",
+        label_visibility="collapsed",
+        key="pitcher_subview",
+    )
+    if sub_view is None:  # clicking the active segment again can deselect it
+        sub_view = "Starters"
 
     league_max_gs = pitchers_data["neutral"]["gs"].max()
     min_gs_threshold = math.ceil(MIN_GS_PCT_OF_MAX * league_max_gs) if pd.notna(league_max_gs) and league_max_gs > 0 else 0
 
-    if st.session_state.pitcher_subview == "starters":
+    if sub_view == "Starters":
         subset = pitchers_data["neutral"]
         subset = subset[subset["gs"] >= min_gs_threshold]
         x_axis_title = "Pitching Run Value (Context-Neutral)"
@@ -672,7 +667,7 @@ else:
     )
     pitcher_chart = build_pitcher_line_chart(
         subset, x_axis_title,
-        show_gs_in_tooltip=(st.session_state.pitcher_subview == "starters"),
+        show_gs_in_tooltip=(sub_view == "Starters"),
     )
     if pitcher_chart is not None:
         st.caption("↔ Scroll horizontally to see all teams on smaller screens.")
