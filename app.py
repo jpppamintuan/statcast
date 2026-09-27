@@ -14,7 +14,6 @@ import requests
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from io import StringIO
 
 st.set_page_config(page_title="Statcast Leaderboard", layout="wide")
@@ -293,11 +292,11 @@ def zebra_index_style(index_values) -> list[str]:
 
 
 def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
-    """Small multiples: one mini number-line subplot per team, arranged in a
-    grid grouped by division (rows) with teams alphabetized within each
-    division (columns). Every subplot shares the same x-axis range
-    (league-wide min/max pitching RV among qualifying starters), so line
-    lengths stay directly comparable across teams. Only pitchers with GS at
+    """One full-width horizontal number line per team (stacked vertically, one
+    row per team), grouped by division with extra blank spacing between
+    divisions and teams alphabetized within each division. Every line shares
+    the same x-axis range (league-wide min/max pitching RV among qualifying
+    starters), so lengths stay directly comparable. Only pitchers with GS at
     least MIN_GS_PCT_OF_MAX of the league's highest GS are shown."""
     league_max_gs = leaderboard["gs"].max()
     if pd.isna(league_max_gs) or league_max_gs <= 0:
@@ -321,43 +320,46 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     pad = max((league_max - league_min) * 0.08, 1)
     x_range = [league_min - pad, league_max + pad]
 
-    min_size, max_size = 8, 20
+    min_size, max_size = 10, 32
 
-    division_rows = [(div, sorted(DIVISIONS[div])) for div in DIVISION_ORDER]
-    subplot_titles = [team for _, teams in division_rows for team in teams]
+    # Build the y-axis category order: teams grouped by division (alphabetized
+    # within each), with a hidden spacer category between divisions for extra
+    # vertical breathing room.
+    y_categories, tick_text = [], []
+    for i, division in enumerate(DIVISION_ORDER):
+        for team in sorted(DIVISIONS[division]):
+            y_categories.append(team)
+            tick_text.append(team)
+        if i < len(DIVISION_ORDER) - 1:
+            gap_key = f"__gap_{i}__"
+            y_categories.append(gap_key)
+            tick_text.append("")
 
-    fig = make_subplots(
-        rows=len(division_rows), cols=5,
-        row_titles=[div for div, _ in division_rows],
-        subplot_titles=subplot_titles,
-        shared_xaxes=True,
-        horizontal_spacing=0.015,
-        vertical_spacing=0.045,
-    )
-
-    for r, (_, teams) in enumerate(division_rows, start=1):
-        for c, team in enumerate(teams, start=1):
+    fig = go.Figure()
+    for division in DIVISION_ORDER:
+        teams = sorted(DIVISIONS[division])
+        for team in teams:
             team_df = starters[starters["team_abbr"] == team].sort_values("pitching_rv")
             team_ids = starters.loc[starters["team_abbr"] == team, "team_id"]
             team_color = TEAM_ID_TO_COLOR.get(int(team_ids.iloc[0]), "#1f77b4") if not team_ids.empty else "#1f77b4"
 
             fig.add_trace(go.Scatter(
-                x=x_range, y=[0, 0],
+                x=x_range, y=[team, team],
                 mode="lines",
                 line=dict(color="rgba(150,150,150,0.4)", width=2),
                 hoverinfo="skip",
                 showlegend=False,
-            ), row=r, col=c)
+            ))
 
             if not team_df.empty:
                 sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
                 customdata = team_df[["team_abbr", "full_name", "gs"]].values
                 fig.add_trace(go.Scatter(
-                    x=team_df["pitching_rv"], y=[0] * len(team_df),
+                    x=team_df["pitching_rv"], y=[team] * len(team_df),
                     mode="markers+text",
                     text=team_df["last_name"],
                     textposition="top center",
-                    textfont=dict(size=9),
+                    textfont=dict(size=10),
                     marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
                     customdata=customdata,
                     hovertemplate=(
@@ -365,19 +367,33 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
                         "Pitching RV: %{x:.0f}<br>GS: %{customdata[2]:.0f}<extra></extra>"
                     ),
                     showlegend=False,
-                ), row=r, col=c)
+                ))
 
-    fig.update_xaxes(range=x_range, showticklabels=False)
-    fig.update_xaxes(showticklabels=True, row=len(division_rows))
-    fig.update_xaxes(title_text="Pitching RV", row=len(division_rows), col=3)
-    fig.update_yaxes(showticklabels=False, zeroline=False, range=[-1, 1.8])
+        # Division label, floating just left of the plot area at the middle
+        # row of that division's block.
+        mid_team = teams[len(teams) // 2]
+        fig.add_annotation(
+            xref="paper", x=-0.005, xanchor="right",
+            yref="y", y=mid_team,
+            text=f"<b>{division}</b>",
+            showarrow=False,
+            font=dict(size=12, color="gray"),
+        )
 
     fig.update_layout(
-        height=185 * len(division_rows) + 60,
-        margin=dict(l=90, r=30, t=40, b=40),
+        height=max(320, 34 * len(y_categories) + 100),
+        margin=dict(l=110, r=30, t=30, b=40),
+        xaxis=dict(title="Pitching Run Value", range=x_range, zeroline=True),
+        yaxis=dict(
+            title="",
+            tickmode="array",
+            tickvals=y_categories,
+            ticktext=tick_text,
+            categoryorder="array",
+            categoryarray=y_categories[::-1],
+        ),
         plot_bgcolor="rgba(0,0,0,0)",
     )
-    fig.update_annotations(font_size=11)
     return fig
 
 
@@ -465,11 +481,12 @@ if st.session_state.view == "total_rv":
 
 else:
     st.caption(
-        "One mini number line per team, grouped by division and alphabetized within "
-        "each division. Dot position = pitching run value (lower to the left, higher "
-        "to the right); dot size = Games Started; dot color = team's primary color; "
-        "every subplot spans the same league-wide min-to-max range. Pitchers with "
-        "fewer than 10% of the league's highest GS are excluded."
+        "One full-width line per team, grouped by division (with extra spacing "
+        "between divisions) and alphabetized within each division. Dot position = "
+        "pitching run value (lower to the left, higher to the right); dot size = "
+        "Games Started; dot color = team's primary color; every line spans the same "
+        "league-wide min-to-max range. Pitchers with fewer than 10% of the league's "
+        "highest GS are excluded."
     )
     pitcher_chart = build_starting_pitcher_chart(leaderboard)
     if pitcher_chart is not None:
