@@ -296,8 +296,10 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     row per team), grouped by division with extra blank spacing between
     divisions and teams alphabetized within each division. Every line shares
     the same x-axis range (league-wide min/max pitching RV among qualifying
-    starters), so lengths stay directly comparable. Only pitchers with GS at
-    least MIN_GS_PCT_OF_MAX of the league's highest GS are shown."""
+    starters), so lengths stay directly comparable. Labels alternate above/
+    below their point when consecutive points on the same line sit close
+    enough to collide. Only pitchers with GS at least MIN_GS_PCT_OF_MAX of
+    the league's highest GS are shown."""
     league_max_gs = leaderboard["gs"].max()
     if pd.isna(league_max_gs) or league_max_gs <= 0:
         return None
@@ -321,19 +323,25 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
     x_range = [league_min - pad, league_max + pad]
 
     min_size, max_size = 10, 32
+    # Points within this fraction of the x-range are considered "close enough"
+    # to collide; the second of the pair gets flipped to the other side.
+    x_span = x_range[1] - x_range[0]
+    collision_gap = x_span * 0.05
 
     # Build the y-axis category order: teams grouped by division (alphabetized
-    # within each), with a hidden spacer category between divisions for extra
-    # vertical breathing room.
+    # within each), with several hidden spacer categories between divisions
+    # for extra vertical breathing room -- bigger gap than the one used
+    # between teams within the same division (which comes from ROW_PX alone).
+    GAPS_BETWEEN_DIVISIONS = 3
     y_categories, tick_text = [], []
     for i, division in enumerate(DIVISION_ORDER):
         for team in sorted(DIVISIONS[division]):
             y_categories.append(team)
             tick_text.append(team)
         if i < len(DIVISION_ORDER) - 1:
-            gap_key = f"__gap_{i}__"
-            y_categories.append(gap_key)
-            tick_text.append("")
+            for g in range(GAPS_BETWEEN_DIVISIONS):
+                y_categories.append(f"__gap_{i}_{g}__")
+                tick_text.append("")
 
     fig = go.Figure()
     for division in DIVISION_ORDER:
@@ -354,11 +362,24 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
             if not team_df.empty:
                 sizes = min_size + (team_df["gs"] / league_max_gs) * (max_size - min_size)
                 customdata = team_df[["team_abbr", "full_name", "gs"]].values
+
+                # Alternate top/bottom placement whenever consecutive points
+                # (sorted left to right) are close enough to collide.
+                text_positions = []
+                prev_x, last_pos = None, "top center"
+                for x in team_df["pitching_rv"]:
+                    if prev_x is not None and (x - prev_x) < collision_gap:
+                        last_pos = "bottom center" if last_pos == "top center" else "top center"
+                    else:
+                        last_pos = "top center"
+                    text_positions.append(last_pos)
+                    prev_x = x
+
                 fig.add_trace(go.Scatter(
                     x=team_df["pitching_rv"], y=[team] * len(team_df),
                     mode="markers+text",
                     text=team_df["last_name"],
-                    textposition="top center",
+                    textposition=text_positions,
                     textfont=dict(size=10),
                     marker=dict(size=sizes, color=team_color, line=dict(color="white", width=1)),
                     customdata=customdata,
@@ -369,20 +390,21 @@ def build_starting_pitcher_chart(leaderboard: pd.DataFrame) -> go.Figure | None:
                     showlegend=False,
                 ))
 
-        # Division label, floating just left of the plot area at the middle
-        # row of that division's block.
+        # Division label, floating well clear of the y-axis tick labels at the
+        # middle row of that division's block.
         mid_team = teams[len(teams) // 2]
         fig.add_annotation(
-            xref="paper", x=-0.005, xanchor="right",
+            xref="paper", x=-0.16, xanchor="right",
             yref="y", y=mid_team,
             text=f"<b>{division}</b>",
             showarrow=False,
             font=dict(size=12, color="gray"),
         )
 
+    ROW_PX = 60
     fig.update_layout(
-        height=max(320, 34 * len(y_categories) + 100),
-        margin=dict(l=110, r=30, t=30, b=40),
+        height=max(400, ROW_PX * len(y_categories) + 120),
+        margin=dict(l=170, r=30, t=30, b=40),
         xaxis=dict(title="Pitching Run Value", range=x_range, zeroline=True),
         yaxis=dict(
             title="",
@@ -485,8 +507,9 @@ else:
         "between divisions) and alphabetized within each division. Dot position = "
         "pitching run value (lower to the left, higher to the right); dot size = "
         "Games Started; dot color = team's primary color; every line spans the same "
-        "league-wide min-to-max range. Pitchers with fewer than 10% of the league's "
-        "highest GS are excluded."
+        "league-wide min-to-max range. Labels flip above/below their point when two "
+        "on the same line sit close together. Pitchers with fewer than 10% of the "
+        "league's highest GS are excluded."
     )
     pitcher_chart = build_starting_pitcher_chart(leaderboard)
     if pitcher_chart is not None:
