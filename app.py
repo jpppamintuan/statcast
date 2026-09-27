@@ -13,6 +13,7 @@ import math
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from io import StringIO
 
@@ -51,6 +52,12 @@ ROW_HEIGHT = 46  # default is 35px; raise this to make the logos bigger
 
 # Zebra-striping base color for even-numbered rows (odd rows stay transparent).
 ZEBRA_COLOR = "rgba(120,120,120,0.08)"
+
+# The pitcher chart renders at this fixed pixel width regardless of viewport.
+# On a wide desktop screen this is roughly full-bleed; on a phone-width
+# screen it's wider than the viewport, so the chart scrolls horizontally
+# inside its own container instead of squishing labels and points together.
+CHART_FIXED_WIDTH = 1300
 
 # --- Pitchers feature config ---------------------------------------------
 # Games Started (GS) and Innings Pitched (IP) aren't on the pitching run-value
@@ -474,6 +481,34 @@ def build_pitcher_line_chart(subset: pd.DataFrame, x_axis_title: str, show_gs_in
     return fig
 
 
+def render_scrollable_chart(fig: go.Figure) -> None:
+    """Render a Plotly figure at a fixed pixel width inside a horizontally
+    scrollable container. On screens narrower than CHART_FIXED_WIDTH (most
+    phones), the chart keeps its full desktop layout and spacing -- the
+    viewer scrolls sideways to see the rest of it, rather than everything
+    getting squeezed to fit.
+
+    st.plotly_chart can't be wrapped this way directly (it renders as its own
+    isolated component, not nested inside surrounding st.markdown HTML), so
+    this exports the figure to a raw HTML snippet and embeds that snippet,
+    plus our own scroll wrapper, together in one components.html iframe."""
+    chart_height = fig.layout.height or 600
+    fig.update_layout(width=CHART_FIXED_WIDTH)
+    chart_html = fig.to_html(
+        include_plotlyjs="cdn",
+        full_html=False,
+        config={"displayModeBar": False, "scrollZoom": False, "doubleClick": False},
+    )
+    wrapped_html = f"""
+    <div style="overflow-x:auto; -webkit-overflow-scrolling:touch;">
+        <div style="width:{CHART_FIXED_WIDTH}px;">
+            {chart_html}
+        </div>
+    </div>
+    """
+    components.html(wrapped_html, height=chart_height + 40, scrolling=False)
+
+
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
@@ -615,10 +650,8 @@ else:
         show_gs_in_tooltip=(st.session_state.pitcher_subview == "starters"),
     )
     if pitcher_chart is not None:
-        st.plotly_chart(
-            pitcher_chart, use_container_width=True,
-            config={"displayModeBar": False, "scrollZoom": False, "doubleClick": False},
-        )
+        st.caption("↔ Scroll horizontally to see all teams on smaller screens.")
+        render_scrollable_chart(pitcher_chart)
     else:
         st.info("No pitcher data available for this season/selection yet.")
 
