@@ -85,7 +85,7 @@ TEAM_PITCHING_SEASON_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=season&group=
 TEAM_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1"
 # Fallback if the team-level sabermetrics stat type above doesn't exist:
 # pull it per player (confirmed to work) and aggregate wRAA by team ourselves.
-PLAYER_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1&limit=2000"
+PLAYER_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1&playerPool=all&limit=2000"
 
 # Candidate JSON field names per stat -- MLB Stats API field names are fairly
 # stable, but this hasn't been live-tested from this environment (no network
@@ -101,7 +101,7 @@ STATSAPI_FIELD_CANDIDATES = {
     "earned_runs": ["earnedRuns"],
     "runs": ["runs"],
     "pa": ["plateAppearances"],
-    "wraa": ["wRAA", "wraa"],
+    "wraa": ["wRaa", "wRAA", "wraa"],
 }
 
 # --- Pitchers feature config ---------------------------------------------
