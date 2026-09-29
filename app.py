@@ -70,6 +70,40 @@ CHART_FIXED_WIDTH = 1300
 # inside that iframe; this family stack is what Plotly is told to use.
 FONT_FAMILY = '"Source Sans Pro", "Source Sans 3", sans-serif'
 
+# --- Team Performance feature config --------------------------------------
+# wRC+ and FIP- aren't available from a site whose terms permit automated
+# access (FanGraphs and Baseball-Reference both explicitly prohibit
+# scraping/API use for building tools). MLB's own Stats API is free, keyless,
+# and official, so team component stats are pulled from there instead and
+# wRC+ / FIP- are computed ourselves from the public formulas -- WITHOUT a
+# park-factor adjustment (that's the deliberate simplification agreed on;
+# FanGraphs' published wRC+/FIP- do include park adjustments, so our numbers
+# will be close but not identical, especially for teams in extreme parks).
+MLB_STATSAPI_BASE = "https://statsapi.mlb.com/api/v1"
+TEAM_HITTING_SEASON_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=season&group=hitting&season={year}&sportId=1"
+TEAM_PITCHING_SEASON_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=season&group=pitching&season={year}&sportId=1"
+TEAM_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1"
+# Fallback if the team-level sabermetrics stat type above doesn't exist:
+# pull it per player (confirmed to work) and aggregate wRAA by team ourselves.
+PLAYER_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1&limit=2000"
+
+# Candidate JSON field names per stat -- MLB Stats API field names are fairly
+# stable, but this hasn't been live-tested from this environment (no network
+# access here), so candidates are kept broad the same way CSV columns are
+# elsewhere in this file. Check the debug panel's "sample_stat_keys" entries
+# if any of these come back empty.
+STATSAPI_FIELD_CANDIDATES = {
+    "hr_allowed": ["homeRuns"],
+    "bb": ["baseOnBalls", "walks"],
+    "hbp": ["hitBatsmen", "hitByPitch"],
+    "so": ["strikeOuts", "strikeouts"],
+    "ip": ["inningsPitched"],
+    "earned_runs": ["earnedRuns"],
+    "runs": ["runs"],
+    "pa": ["plateAppearances"],
+    "wraa": ["wRAA", "wraa"],
+}
+
 # --- Pitchers feature config ---------------------------------------------
 # Games Started (GS) and Innings Pitched (IP) aren't on the pitching run-value
 # leaderboard, so they're pulled separately from this custom leaderboard.
@@ -150,6 +184,53 @@ def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
         if c in df.columns:
             return c
     return None
+
+
+def pick_stat(stat: dict, candidates: list[str]):
+    """Same idea as pick_col, but for a JSON stat dict's keys instead of a
+    DataFrame's columns (used for the MLB Stats API responses)."""
+    for c in candidates:
+        if c in stat:
+            return stat[c]
+    return None
+
+
+def parse_innings_pitched(value) -> float:
+    """MLB's innings-pitched notation uses .0/.1/.2 for outs (thirds), not
+    real tenths (e.g. "162.1" means 162 innings and 1 out = 162 + 1/3). This
+    matters here because FIP needs an actual sum/divide, unlike the
+    threshold-only IP comparison used elsewhere in this file."""
+    if value is None:
+        return 0.0
+    s = str(value)
+    whole_str, sep, frac_str = s.partition(".")
+    try:
+        whole = float(whole_str)
+    except ValueError:
+        return 0.0
+    outs = 0
+    if sep and frac_str:
+        try:
+            outs = int(frac_str[0])
+        except ValueError:
+            outs = 0
+    return whole + outs / 3.0
+
+
+@st.cache_data(ttl=None, show_spinner=False)
+def fetch_json(url: str) -> dict:
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def extract_team_splits(payload: dict) -> list[dict]:
+    """MLB Stats API team-stats responses nest results under
+    stats[0].splits, each split holding a 'team' dict and a 'stat' dict."""
+    try:
+        return payload["stats"][0]["splits"]
+    except (KeyError, IndexError, TypeError):
+        return []
 
 
 # ttl=None -> cache never expires on its own. The only way data gets re-fetched
@@ -317,6 +398,201 @@ def build_pitchers_data(year: int):
         datasets[mode] = merged
 
     return datasets, debug_info
+
+
+@st.cache_data(ttl=None, show_spinner=False)
+def build_team_performance_data(year: int):
+    """Team-level wRC+ and FIP-, computed ourselves (no park adjustment) from
+    MLB Stats API component totals -- see the config comment above for why."""
+    debug_info = {}
+
+    # --- Team pitching component totals (drives FIP-) ---
+    pitching_rows = []
+    try:
+        payload = fetch_json(TEAM_PITCHING_SEASON_URL.format(year=year))
+        splits = extract_team_splits(payload)
+        for split in splits:
+            team = split.get("team", {})
+            stat = split.get("stat", {})
+            pitching_rows.append({
+                "team_id": team.get("id"),
+                "hr_allowed": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hr_allowed"]),
+                "bb": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["bb"]),
+                "hbp": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hbp"]),
+                "so": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["so"]),
+                "ip": parse_innings_pitched(pick_stat(stat, STATSAPI_FIELD_CANDIDATES["ip"])),
+                "earned_runs": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["earned_runs"]),
+            })
+        debug_info["team_pitching_season"] = {
+            "status": "ok", "url": TEAM_PITCHING_SEASON_URL.format(year=year),
+            "teams_found": len(splits),
+            "sample_stat_keys": list(splits[0]["stat"].keys()) if splits else [],
+        }
+    except Exception as e:
+        debug_info["team_pitching_season"] = {"status": f"error: {e}", "url": TEAM_PITCHING_SEASON_URL.format(year=year)}
+    pitching_df = pd.DataFrame(pitching_rows)
+
+    # --- Team hitting totals (team PA, plus league runs/PA) ---
+    hitting_rows = []
+    try:
+        payload = fetch_json(TEAM_HITTING_SEASON_URL.format(year=year))
+        splits = extract_team_splits(payload)
+        for split in splits:
+            team = split.get("team", {})
+            stat = split.get("stat", {})
+            hitting_rows.append({
+                "team_id": team.get("id"),
+                "runs": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["runs"]),
+                "pa": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["pa"]),
+            })
+        debug_info["team_hitting_season"] = {
+            "status": "ok", "url": TEAM_HITTING_SEASON_URL.format(year=year),
+            "teams_found": len(splits),
+            "sample_stat_keys": list(splits[0]["stat"].keys()) if splits else [],
+        }
+    except Exception as e:
+        debug_info["team_hitting_season"] = {"status": f"error: {e}", "url": TEAM_HITTING_SEASON_URL.format(year=year)}
+    hitting_df = pd.DataFrame(hitting_rows)
+
+    # --- Team wRAA (drives wRC+) -- try team-level sabermetrics first, fall
+    # back to aggregating player-level sabermetrics by team if that stat type
+    # isn't available at the team level. ---
+    wraa_rows = []
+    try:
+        payload = fetch_json(TEAM_HITTING_SABERMETRICS_URL.format(year=year))
+        splits = extract_team_splits(payload)
+        for split in splits:
+            team = split.get("team", {})
+            stat = split.get("stat", {})
+            wraa_val = pick_stat(stat, STATSAPI_FIELD_CANDIDATES["wraa"])
+            if wraa_val is not None:
+                wraa_rows.append({"team_id": team.get("id"), "wraa": wraa_val})
+        debug_info["team_hitting_sabermetrics"] = {
+            "status": "ok" if wraa_rows else "fetched but no wRAA field found",
+            "url": TEAM_HITTING_SABERMETRICS_URL.format(year=year),
+            "teams_found": len(splits),
+            "sample_stat_keys": list(splits[0]["stat"].keys()) if splits else [],
+        }
+    except Exception as e:
+        debug_info["team_hitting_sabermetrics"] = {"status": f"error: {e}", "url": TEAM_HITTING_SABERMETRICS_URL.format(year=year)}
+
+    if not wraa_rows:
+        try:
+            payload = fetch_json(PLAYER_HITTING_SABERMETRICS_URL.format(year=year))
+            splits = extract_team_splits(payload)
+            player_rows = []
+            for split in splits:
+                team = split.get("team", {})
+                stat = split.get("stat", {})
+                wraa_val = pick_stat(stat, STATSAPI_FIELD_CANDIDATES["wraa"])
+                if team.get("id") is not None and wraa_val is not None:
+                    player_rows.append({"team_id": team.get("id"), "wraa": wraa_val})
+            player_df = pd.DataFrame(player_rows)
+            if not player_df.empty:
+                agg = player_df.groupby("team_id", as_index=False)["wraa"].sum()
+                wraa_rows = agg.to_dict("records")
+            debug_info["player_hitting_sabermetrics_fallback"] = {
+                "status": "ok" if wraa_rows else "fetched but no wRAA field found",
+                "url": PLAYER_HITTING_SABERMETRICS_URL.format(year=year),
+                "players_found": len(splits),
+                "sample_stat_keys": list(splits[0]["stat"].keys()) if splits else [],
+            }
+        except Exception as e:
+            debug_info["player_hitting_sabermetrics_fallback"] = {"status": f"error: {e}", "url": PLAYER_HITTING_SABERMETRICS_URL.format(year=year)}
+    wraa_df = pd.DataFrame(wraa_rows) if wraa_rows else pd.DataFrame(columns=["team_id", "wraa"])
+
+    if pitching_df.empty or hitting_df.empty:
+        return pd.DataFrame(), debug_info
+
+    combined = pitching_df.merge(hitting_df, on="team_id", how="outer")
+    combined = combined.merge(wraa_df, on="team_id", how="left")
+    numeric_cols = ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs", "runs", "pa", "wraa"]
+    for c in numeric_cols:
+        combined[c] = pd.to_numeric(combined[c], errors="coerce")
+    combined = combined.dropna(subset=["team_id"])
+
+    # --- League totals (straight sums across all teams, not an average of
+    # per-team rates, so partial/extra-inning games don't skew things) ---
+    league_hr = combined["hr_allowed"].sum()
+    league_bb = combined["bb"].sum()
+    league_hbp = combined["hbp"].sum()
+    league_so = combined["so"].sum()
+    league_ip = combined["ip"].sum()
+    league_er = combined["earned_runs"].sum()
+    league_era = 9 * league_er / league_ip if league_ip else None
+    league_runs = combined["runs"].sum()
+    league_pa = combined["pa"].sum()
+    league_r_pa = league_runs / league_pa if league_pa else None
+
+    fip_constant = None
+    if league_era is not None and league_ip:
+        fip_constant = league_era - (13 * league_hr + 3 * (league_bb + league_hbp) - 2 * league_so) / league_ip
+
+    debug_info["league_totals"] = {
+        "league_era": league_era, "fip_constant": fip_constant,
+        "league_r_pa": league_r_pa, "league_ip": league_ip,
+    }
+
+    def compute_row(row):
+        fip = fip_minus = wrc_plus = None
+        if row["ip"] and fip_constant is not None:
+            fip = (13 * row["hr_allowed"] + 3 * (row["bb"] + row["hbp"]) - 2 * row["so"]) / row["ip"] + fip_constant
+            if league_era:
+                fip_minus = (fip / league_era) * 100
+        if pd.notna(row.get("wraa")) and row.get("pa") and league_r_pa:
+            wrc_plus = ((row["wraa"] / row["pa"] + league_r_pa) / league_r_pa) * 100
+        return pd.Series({"fip": fip, "fip_minus": fip_minus, "wrc_plus": wrc_plus})
+
+    combined = pd.concat([combined, combined.apply(compute_row, axis=1)], axis=1)
+    combined["team_abbr"] = combined["team_id"].apply(
+        lambda t: TEAM_ID_TO_ABBR.get(int(t), str(int(t))) if pd.notna(t) else None
+    )
+    return combined, debug_info
+
+
+def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
+    """One point per team: wRC+ on x (higher = better hitting), FIP- on y.
+    The y-axis is reversed so "up" always means "better" in both dimensions
+    (lower FIP- is actually better pitching, same convention as ERA-) --
+    without the reversal, the top-right corner would misleadingly mix a good
+    result (high wRC+) with a bad one (high FIP-). Dashed lines mark the
+    100 = league-average point on each axis."""
+    df = df.dropna(subset=["wrc_plus", "fip_minus", "team_id"]).copy()
+    if df.empty:
+        return None
+
+    fig = go.Figure()
+    for _, row in df.iterrows():
+        team_id = int(row["team_id"])
+        color = TEAM_ID_TO_COLOR.get(team_id, "#1f77b4")
+        abbr = row["team_abbr"]
+        fig.add_trace(go.Scatter(
+            x=[row["wrc_plus"]], y=[row["fip_minus"]],
+            mode="markers+text",
+            text=[abbr],
+            textposition="top center",
+            textfont=dict(size=11, family=FONT_FAMILY),
+            marker=dict(size=16, color=color, line=dict(color="white", width=1)),
+            hovertemplate=(
+                f"{abbr}<br>wRC+: {row['wrc_plus']:.0f}<br>FIP-: {row['fip_minus']:.0f}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    fig.add_vline(x=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
+    fig.add_hline(y=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
+
+    fig.update_layout(
+        height=650,
+        margin=dict(l=70, r=40, t=30, b=60),
+        font=dict(family=FONT_FAMILY),
+        xaxis=dict(title="wRC+  (100 = league average, higher is better)", fixedrange=True),
+        yaxis=dict(title="FIP-  (100 = league average, lower is better)", autorange="reversed", fixedrange=True),
+        dragmode=False,
+        hoverlabel=dict(font=dict(family=FONT_FAMILY)),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
 
 
 def diverging_column_style(col: pd.Series) -> list[str]:
@@ -551,7 +827,7 @@ with st.spinner("Pulling live data from Baseball Savant..."):
 if "view" not in st.session_state:
     st.session_state.view = "total_rv"
 
-btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+btn_col1, btn_col2, btn_col3, _ = st.columns([1, 1, 1, 3])
 with btn_col1:
     if st.button(
         "Total RV", use_container_width=True,
@@ -565,6 +841,13 @@ with btn_col2:
         type="primary" if st.session_state.view == "starting_pitchers" else "secondary",
     ):
         st.session_state.view = "starting_pitchers"
+        st.rerun()
+with btn_col3:
+    if st.button(
+        "Team Performance", use_container_width=True,
+        type="primary" if st.session_state.view == "team_performance" else "secondary",
+    ):
+        st.session_state.view = "team_performance"
         st.rerun()
 
 if st.session_state.view == "total_rv":
@@ -618,7 +901,7 @@ if st.session_state.view == "total_rv":
 
     debug_to_show = debug_info
 
-else:
+elif st.session_state.view == "starting_pitchers":
     with st.spinner("Pulling live pitcher data from Baseball Savant..."):
         pitchers_data, pitchers_debug = build_pitchers_data(int(year))
 
@@ -676,6 +959,25 @@ else:
         st.info("No pitcher data available for this season/selection yet.")
 
     debug_to_show = {**debug_info, **pitchers_debug}
+
+else:
+    with st.spinner("Pulling live team data from MLB Stats API..."):
+        team_perf_df, team_perf_debug = build_team_performance_data(int(year))
+
+    st.caption(
+        "Team-level wRC+ and FIP-, computed from MLB's official Stats API "
+        "(FanGraphs and Baseball-Reference both prohibit automated/scraped access "
+        "to their own versions of these stats). **No park-factor adjustment** -- "
+        "FanGraphs' published wRC+/FIP- do adjust for park, so these numbers will "
+        "be close but not identical, especially for teams in extreme parks."
+    )
+    team_perf_chart = build_team_performance_chart(team_perf_df)
+    if team_perf_chart is not None:
+        render_scrollable_chart(team_perf_chart)
+    else:
+        st.info("No team performance data available for this season yet.")
+
+    debug_to_show = team_perf_debug
 
 with st.expander("🔧 Debug: raw source status & column mapping (check this if numbers look off)"):
     for category, info in debug_to_show.items():
