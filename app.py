@@ -102,6 +102,11 @@ STATSAPI_FIELD_CANDIDATES = {
     "runs": ["runs"],
     "pa": ["plateAppearances"],
     "wraa": ["wRaa", "wRAA", "wraa"],
+    # Team-level wins/losses -- confirmed present on the team pitching "season"
+    # stat endpoint (TEAM_PITCHING_SEASON_URL), which is the team's actual
+    # season record, NOT the sum of individual pitchers' win/loss decisions.
+    "wins": ["wins"],
+    "losses": ["losses"],
 }
 
 # Team fielding run value -- from Savant's own CSV export, same mechanism as
@@ -448,6 +453,8 @@ def build_team_performance_data(year: int):
                 "so": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["so"]),
                 "ip": parse_innings_pitched(pick_stat(stat, STATSAPI_FIELD_CANDIDATES["ip"])),
                 "earned_runs": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["earned_runs"]),
+                "wins": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["wins"]),
+                "losses": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["losses"]),
             })
         debug_info["team_pitching_season"] = {
             "status": "ok", "url": TEAM_PITCHING_SEASON_URL.format(year=year),
@@ -542,7 +549,7 @@ def build_team_performance_data(year: int):
     combined = pitching_df.merge(hitting_df, on="team_id", how="outer")
     combined = combined.merge(wraa_df, on="team_id", how="left")
     combined = combined.merge(fielding_df, on="team_id", how="left")
-    numeric_cols = ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs", "runs", "pa", "wraa", "fielding_rv"]
+    numeric_cols = ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs", "runs", "pa", "wraa", "fielding_rv", "wins", "losses"]
     for c in numeric_cols:
         combined[c] = pd.to_numeric(combined[c], errors="coerce")
     combined = combined.dropna(subset=["team_id"])
@@ -602,8 +609,10 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     teams -- so a team's shade reflects how it compares leaguewide, not just
     its own raw number. This uses Plotly's native numeric color + colorscale
     (rather than pre-computed rgba strings) specifically so a real colorbar
-    legend can be attached to it. Point size is constant; team identity is
-    just the black label text next to each point."""
+    legend can be attached to it. Marker SIZE is a fourth dimension: team
+    wins (from the team pitching stat endpoint's own win total -- the
+    team's actual season record, not a sum of individual pitchers' win/loss
+    decisions). Team identity is the black label text next to each point."""
     df = df.dropna(subset=["wrc_plus", "fip_minus", "team_id"]).copy()
     if df.empty:
         return None
@@ -626,6 +635,28 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         [0.5, "rgb(225,225,225)"],  # zero -- neutral gray
         [1.0, "rgb(214,39,40)"],    # most positive -- red
     ]
+
+    # Marker size <- wins. Chosen purely for legibility: big enough that the
+    # worst team's dot is still clearly a dot, small enough that the best
+    # team's dot doesn't swallow its neighbors' labels.
+    MIN_MARKER_SIZE, MAX_MARKER_SIZE = 12, 34
+    has_wins = "wins" in df.columns and df["wins"].notna().any()
+    if has_wins:
+        win_min, win_max = df["wins"].min(), df["wins"].max()
+
+        def size_for_wins(w):
+            if pd.isna(w) or win_max == win_min:
+                return (MIN_MARKER_SIZE + MAX_MARKER_SIZE) / 2
+            frac = (w - win_min) / (win_max - win_min)
+            return MIN_MARKER_SIZE + frac * (MAX_MARKER_SIZE - MIN_MARKER_SIZE)
+
+        # Sort biggest-wins first: traces draw in array order (later = on
+        # top), so putting the biggest circles first and smallest last means
+        # a smaller point never gets buried under a bigger overlapping one.
+        df = df.sort_values("wins", ascending=False).reset_index(drop=True)
+        marker_sizes = df["wins"].apply(size_for_wins)
+    else:
+        marker_sizes = pd.Series(MAX_MARKER_SIZE / 2, index=df.index)
 
     fig = go.Figure()
 
@@ -655,7 +686,11 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
 
     # All 30 teams as one trace (not one trace per team) -- needed so a
     # single colorbar legend renders once, rather than once per team.
-    customdata = df[["team_abbr", "wrc_plus", "fip_minus", "fielding_rv"]].values
+    if "wins" not in df.columns:
+        df["wins"] = None
+    if "losses" not in df.columns:
+        df["losses"] = None
+    customdata = df[["team_abbr", "wrc_plus", "fip_minus", "fielding_rv", "wins", "losses"]].values
     fig.add_trace(go.Scatter(
         x=df["wrc_plus"], y=df["fip_minus"],
         mode="markers+text",
@@ -663,31 +698,47 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         textposition="top center",
         textfont=dict(size=11, family=FONT_FAMILY, color="black"),
         marker=dict(
-            size=16,
+            size=marker_sizes,
             color=fielding_vals,
             colorscale=DIVERGING_COLORSCALE,
             cmin=-fielding_max_abs, cmax=fielding_max_abs,
             line=dict(color="white", width=1),
             colorbar=dict(
                 orientation="h",
-                thickness=10,
-                len=0.5,
-                x=0.5, xanchor="center",
+                thickness=5,
+                len=0.25,
+                x=0.22, xanchor="center",
                 y=-0.16, yanchor="top",
                 tickmode="array",
                 tickvals=[-fielding_max_abs, 0, fielding_max_abs],
                 ticktext=["◀ Worse fielding", "Avg", "Better fielding ▶"],
                 outlinewidth=0,
-                tickfont=dict(size=10, family=FONT_FAMILY),
+                tickfont=dict(size=9, family=FONT_FAMILY),
             ),
         ),
         customdata=customdata,
         hovertemplate=(
             "%{customdata[0]}<br>wRC+: %{customdata[1]:.0f}<br>FIP-: %{customdata[2]:.0f}"
-            "<br>Fielding RV: %{customdata[3]:.0f}<extra></extra>"
+            "<br>Fielding RV: %{customdata[3]:.0f}<br>Record: %{customdata[4]:.0f}-%{customdata[5]:.0f}<extra></extra>"
         ),
         showlegend=False,
     ))
+
+    # Bubble-size legend for wins, placed beside the colorbar. Plotly has no
+    # native "size legend" the way it has colorbar for color, so this is the
+    # standard workaround: invisible off-chart points (x=None), one per
+    # reference win total, shown only for their legend entry.
+    if has_wins:
+        legend_win_values = sorted(set(round(v) for v in [win_min, (win_min + win_max) / 2, win_max]))
+        for wv in legend_win_values:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(size=size_for_wins(wv), color="rgba(160,160,160,0.6)", line=dict(color="white", width=1)),
+                name=f"{wv} wins",
+                showlegend=True,
+                hoverinfo="skip",
+            ))
 
     fig.add_vline(x=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
     fig.add_hline(y=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
@@ -696,11 +747,24 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         height=650,
         margin=dict(l=70, r=40, t=30, b=110),
         font=dict(family=FONT_FAMILY),
-        xaxis=dict(title="wRC+  (100 = league average, higher is better)", range=x_range, fixedrange=True),
-        yaxis=dict(title="FIP-  (100 = league average, lower is better)", range=y_range[::-1], fixedrange=True),
+        xaxis=dict(
+            title="wRC+ (100 = league average)<br>→ better hitting",
+            range=x_range, fixedrange=True,
+        ),
+        yaxis=dict(
+            title="FIP- (100 = league average)<br>↑ better pitching",
+            range=y_range[::-1], fixedrange=True,
+        ),
         dragmode=False,
         hoverlabel=dict(font=dict(family=FONT_FAMILY)),
         plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h",
+            x=0.62, xanchor="left",
+            y=-0.16, yanchor="top",
+            title=dict(text="Wins", font=dict(size=10, family=FONT_FAMILY)),
+            font=dict(size=9, family=FONT_FAMILY),
+        ),
     )
     return fig
 
@@ -1080,10 +1144,12 @@ else:
         "access to their own versions of these stats). **No park-factor adjustment** "
         "-- FanGraphs' published wRC+/FIP- do adjust for park, so these numbers will "
         "be close but not identical, especially for teams in extreme parks. Fielding "
-        "run value (from Baseball Savant) is the third dimension, shown as marker "
-        "color: red = above-average fielding, blue = below-average, gray = league "
-        "average, scaled relative to the other 29 teams. Team color is on the label "
-        "text, not the marker."
+        "run value (from Baseball Savant) is a third dimension, shown as marker color: "
+        "red = above-average fielding, blue = below-average, gray = league average, "
+        "scaled relative to the other 29 teams (see the colorbar below the chart). "
+        "Wins are a fourth dimension, shown as marker size (see the Wins legend to "
+        "its right) -- the team's actual season win total, not a sum of individual "
+        "pitchers' decisions. Full win-loss record is in the tooltip."
     )
     team_perf_chart = build_team_performance_chart(team_perf_df)
     if team_perf_chart is not None:
