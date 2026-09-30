@@ -104,6 +104,14 @@ STATSAPI_FIELD_CANDIDATES = {
     "wraa": ["wRaa", "wRAA", "wraa"],
 }
 
+# Team fielding run value -- from Savant's own CSV export, same mechanism as
+# every other Savant source in this file (not MLB Stats API, which doesn't
+# have a fielding-run-value equivalent).
+TEAM_FIELDING_RV_URL = "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?gameType=Regular&seasonStart={year}&seasonEnd={year}&type=fielding-team&position=0&minInnings=q&minResults=1&csv=true"
+TEAM_FIELDING_ID_CANDIDATES = ["id", "team_id"]
+TEAM_FIELDING_NAME_CANDIDATES = ["name", "team_name"]
+TEAM_FIELDING_RV_CANDIDATES = ["total_runs", "run_value", "fielding_run_value"]
+
 # --- Pitchers feature config ---------------------------------------------
 # Games Started (GS) and Innings Pitched (IP) aren't on the pitching run-value
 # leaderboard, so they're pulled separately from this custom leaderboard.
@@ -291,6 +299,24 @@ def normalize_starts(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "ip": pd.to_numeric(df[ip_col], errors="coerce") if ip_col else pd.NA,
     })
     return out.dropna(subset=["player_id"]), debug
+
+
+def normalize_team_fielding(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Reduce the team fielding-run-value leaderboard CSV down to
+    [team_id, fielding_rv]."""
+    debug = {"columns_found": list(df.columns), "rows": len(df)}
+    id_col = pick_col(df, TEAM_FIELDING_ID_CANDIDATES)
+    rv_col = pick_col(df, TEAM_FIELDING_RV_CANDIDATES)
+    debug.update({"id_col_used": id_col, "rv_col_used": rv_col})
+
+    if id_col is None or rv_col is None:
+        return pd.DataFrame(columns=["team_id", "fielding_rv"]), debug
+
+    out = pd.DataFrame({
+        "team_id": pd.to_numeric(df[id_col], errors="coerce"),
+        "fielding_rv": pd.to_numeric(df[rv_col], errors="coerce"),
+    })
+    return out.dropna(subset=["team_id"]), debug
 
 
 def format_last_first(full_name: str) -> str:
@@ -501,12 +527,22 @@ def build_team_performance_data(year: int):
             debug_info["player_hitting_sabermetrics_fallback"] = {"status": f"error: {e}", "url": PLAYER_HITTING_SABERMETRICS_URL.format(year=year)}
     wraa_df = pd.DataFrame(wraa_rows) if wraa_rows else pd.DataFrame(columns=["team_id", "wraa"])
 
+    # --- Team fielding run value (third dimension, from Savant directly) ---
+    try:
+        fielding_raw = fetch_csv(TEAM_FIELDING_RV_URL.format(year=year))
+        fielding_df, fielding_debug = normalize_team_fielding(fielding_raw)
+        debug_info["team_fielding_rv"] = {"status": "ok", "url": TEAM_FIELDING_RV_URL.format(year=year), **fielding_debug}
+    except Exception as e:
+        fielding_df = pd.DataFrame(columns=["team_id", "fielding_rv"])
+        debug_info["team_fielding_rv"] = {"status": f"error: {e}", "url": TEAM_FIELDING_RV_URL.format(year=year)}
+
     if pitching_df.empty or hitting_df.empty:
         return pd.DataFrame(), debug_info
 
     combined = pitching_df.merge(hitting_df, on="team_id", how="outer")
     combined = combined.merge(wraa_df, on="team_id", how="left")
-    numeric_cols = ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs", "runs", "pa", "wraa"]
+    combined = combined.merge(fielding_df, on="team_id", how="left")
+    numeric_cols = ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs", "runs", "pa", "wraa", "fielding_rv"]
     for c in numeric_cols:
         combined[c] = pd.to_numeric(combined[c], errors="coerce")
     combined = combined.dropna(subset=["team_id"])
@@ -558,7 +594,15 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     result (high wRC+) with a bad one (high FIP-). Axis ranges are forced
     symmetric around 100 on each axis, so the league-average point (100, 100)
     always sits at the visual center of the plot rather than wherever the
-    data's own min/max happen to place it."""
+    data's own min/max happen to place it.
+
+    Fielding run value is the third dimension, shown as marker FILL color on
+    the same red (positive) / blue (negative) / neutral (zero) diverging
+    scale used for run values on the Total RV table -- scaled here across all
+    30 teams the same way that table's columns are, so a team's shade
+    reflects how it compares leaguewide, not just its own raw number. Point
+    size is constant (fielding no longer needs to double up on size); team
+    identity is carried by the label text color instead of the marker."""
     df = df.dropna(subset=["wrc_plus", "fip_minus", "team_id"]).copy()
     if df.empty:
         return None
@@ -570,6 +614,19 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     y_half = max((df["fip_minus"] - 100).abs().max(), 1) * 1.15
     x_range = [100 - x_half, 100 + x_half]
     y_range = [100 - y_half, 100 + y_half]  # smaller FIP- (better) at the low end
+
+    fielding_max_abs = df["fielding_rv"].abs().max() if "fielding_rv" in df.columns else None
+    if pd.isna(fielding_max_abs) or not fielding_max_abs:
+        fielding_max_abs = 1
+
+    def fielding_marker_color(value) -> str:
+        if pd.isna(value) or value == 0:
+            return "rgb(225,225,225)"  # neutral/uncolored -- still visible as a marker
+        intensity = min(abs(value) / fielding_max_abs, 1)
+        alpha = 0.15 + 0.65 * intensity
+        if value > 0:
+            return f"rgba(214,39,40,{alpha:.2f})"
+        return f"rgba(31,119,180,{alpha:.2f})"
 
     fig = go.Figure()
 
@@ -599,17 +656,20 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
 
     for _, row in df.iterrows():
         team_id = int(row["team_id"])
-        color = TEAM_ID_TO_COLOR.get(team_id, "#1f77b4")
+        label_color = TEAM_ID_TO_COLOR.get(team_id, "#1f77b4")
         abbr = row["team_abbr"]
+        fielding_val = row.get("fielding_rv")
+        fielding_str = f"{fielding_val:.0f}" if pd.notna(fielding_val) else "N/A"
         fig.add_trace(go.Scatter(
             x=[row["wrc_plus"]], y=[row["fip_minus"]],
             mode="markers+text",
             text=[abbr],
             textposition="top center",
-            textfont=dict(size=11, family=FONT_FAMILY),
-            marker=dict(size=16, color=color, line=dict(color="white", width=1)),
+            textfont=dict(size=11, family=FONT_FAMILY, color=label_color),
+            marker=dict(size=16, color=fielding_marker_color(fielding_val), line=dict(color="white", width=1)),
             hovertemplate=(
-                f"{abbr}<br>wRC+: {row['wrc_plus']:.0f}<br>FIP-: {row['fip_minus']:.0f}<extra></extra>"
+                f"{abbr}<br>wRC+: {row['wrc_plus']:.0f}<br>FIP-: {row['fip_minus']:.0f}"
+                f"<br>Fielding RV: {fielding_str}<extra></extra>"
             ),
             showlegend=False,
         ))
@@ -1000,11 +1060,15 @@ else:
         team_perf_df, team_perf_debug = build_team_performance_data(int(year))
 
     st.caption(
-        "Team-level wRC+ and FIP-, computed from MLB's official Stats API "
-        "(FanGraphs and Baseball-Reference both prohibit automated/scraped access "
-        "to their own versions of these stats). **No park-factor adjustment** -- "
-        "FanGraphs' published wRC+/FIP- do adjust for park, so these numbers will "
-        "be close but not identical, especially for teams in extreme parks."
+        "Team-level wRC+ (x-axis) and FIP- (y-axis), computed from MLB's official "
+        "Stats API (FanGraphs and Baseball-Reference both prohibit automated/scraped "
+        "access to their own versions of these stats). **No park-factor adjustment** "
+        "-- FanGraphs' published wRC+/FIP- do adjust for park, so these numbers will "
+        "be close but not identical, especially for teams in extreme parks. Fielding "
+        "run value (from Baseball Savant) is the third dimension, shown as marker "
+        "color: red = above-average fielding, blue = below-average, gray = league "
+        "average, scaled relative to the other 29 teams. Team color is on the label "
+        "text, not the marker."
     )
     team_perf_chart = build_team_performance_chart(team_perf_df)
     if team_perf_chart is not None:
