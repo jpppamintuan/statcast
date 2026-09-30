@@ -597,12 +597,13 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     data's own min/max happen to place it.
 
     Fielding run value is the third dimension, shown as marker FILL color on
-    the same red (positive) / blue (negative) / neutral (zero) diverging
-    scale used for run values on the Total RV table -- scaled here across all
-    30 teams the same way that table's columns are, so a team's shade
-    reflects how it compares leaguewide, not just its own raw number. Point
-    size is constant (fielding no longer needs to double up on size); team
-    identity is carried by the label text color instead of the marker."""
+    a red (positive) / gray (zero) / blue (negative) diverging scale, scaled
+    symmetrically around 0 using the largest absolute value across all 30
+    teams -- so a team's shade reflects how it compares leaguewide, not just
+    its own raw number. This uses Plotly's native numeric color + colorscale
+    (rather than pre-computed rgba strings) specifically so a real colorbar
+    legend can be attached to it. Point size is constant; team identity is
+    just the black label text next to each point."""
     df = df.dropna(subset=["wrc_plus", "fip_minus", "team_id"]).copy()
     if df.empty:
         return None
@@ -615,18 +616,16 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     x_range = [100 - x_half, 100 + x_half]
     y_range = [100 - y_half, 100 + y_half]  # smaller FIP- (better) at the low end
 
-    fielding_max_abs = df["fielding_rv"].abs().max() if "fielding_rv" in df.columns else None
+    fielding_vals = df["fielding_rv"].fillna(0) if "fielding_rv" in df.columns else pd.Series(0, index=df.index)
+    fielding_max_abs = fielding_vals.abs().max()
     if pd.isna(fielding_max_abs) or not fielding_max_abs:
         fielding_max_abs = 1
 
-    def fielding_marker_color(value) -> str:
-        if pd.isna(value) or value == 0:
-            return "rgb(225,225,225)"  # neutral/uncolored -- still visible as a marker
-        intensity = min(abs(value) / fielding_max_abs, 1)
-        alpha = 0.15 + 0.65 * intensity
-        if value > 0:
-            return f"rgba(214,39,40,{alpha:.2f})"
-        return f"rgba(31,119,180,{alpha:.2f})"
+    DIVERGING_COLORSCALE = [
+        [0.0, "rgb(31,119,180)"],   # most negative -- blue
+        [0.5, "rgb(225,225,225)"],  # zero -- neutral gray
+        [1.0, "rgb(214,39,40)"],    # most positive -- red
+    ]
 
     fig = go.Figure()
 
@@ -654,32 +653,48 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         showlegend=False,
     ))
 
-    for _, row in df.iterrows():
-        team_id = int(row["team_id"])
-        label_color = TEAM_ID_TO_COLOR.get(team_id, "#1f77b4")
-        abbr = row["team_abbr"]
-        fielding_val = row.get("fielding_rv")
-        fielding_str = f"{fielding_val:.0f}" if pd.notna(fielding_val) else "N/A"
-        fig.add_trace(go.Scatter(
-            x=[row["wrc_plus"]], y=[row["fip_minus"]],
-            mode="markers+text",
-            text=[abbr],
-            textposition="top center",
-            textfont=dict(size=11, family=FONT_FAMILY, color=label_color),
-            marker=dict(size=16, color=fielding_marker_color(fielding_val), line=dict(color="white", width=1)),
-            hovertemplate=(
-                f"{abbr}<br>wRC+: {row['wrc_plus']:.0f}<br>FIP-: {row['fip_minus']:.0f}"
-                f"<br>Fielding RV: {fielding_str}<extra></extra>"
+    # All 30 teams as one trace (not one trace per team) -- needed so a
+    # single colorbar legend renders once, rather than once per team.
+    customdata = df[["team_abbr", "wrc_plus", "fip_minus", "fielding_rv"]].values
+    fig.add_trace(go.Scatter(
+        x=df["wrc_plus"], y=df["fip_minus"],
+        mode="markers+text",
+        text=df["team_abbr"],
+        textposition="top center",
+        textfont=dict(size=11, family=FONT_FAMILY, color="black"),
+        marker=dict(
+            size=16,
+            color=fielding_vals,
+            colorscale=DIVERGING_COLORSCALE,
+            cmin=-fielding_max_abs, cmax=fielding_max_abs,
+            line=dict(color="white", width=1),
+            colorbar=dict(
+                orientation="h",
+                thickness=10,
+                len=0.5,
+                x=0.5, xanchor="center",
+                y=-0.16, yanchor="top",
+                tickmode="array",
+                tickvals=[-fielding_max_abs, 0, fielding_max_abs],
+                ticktext=["◀ Worse fielding", "Avg", "Better fielding ▶"],
+                outlinewidth=0,
+                tickfont=dict(size=10, family=FONT_FAMILY),
             ),
-            showlegend=False,
-        ))
+        ),
+        customdata=customdata,
+        hovertemplate=(
+            "%{customdata[0]}<br>wRC+: %{customdata[1]:.0f}<br>FIP-: %{customdata[2]:.0f}"
+            "<br>Fielding RV: %{customdata[3]:.0f}<extra></extra>"
+        ),
+        showlegend=False,
+    ))
 
     fig.add_vline(x=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
     fig.add_hline(y=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
 
     fig.update_layout(
         height=650,
-        margin=dict(l=70, r=40, t=30, b=60),
+        margin=dict(l=70, r=40, t=30, b=110),
         font=dict(family=FONT_FAMILY),
         xaxis=dict(title="wRC+  (100 = league average, higher is better)", range=x_range, fixedrange=True),
         yaxis=dict(title="FIP-  (100 = league average, lower is better)", range=y_range[::-1], fixedrange=True),
