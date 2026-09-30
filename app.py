@@ -573,23 +573,29 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
 
     fig = go.Figure()
 
-    # Subtle quadrant labels, drawn behind the markers (layer="below").
-    # "Good pitching" is the low-FIP- half, which renders at the TOP once the
-    # y-axis is reversed below -- labels are placed by data value, not by
-    # screen position, so this still comes out visually correct.
+    # Subtle quadrant labels, drawn behind the markers. go.layout.Annotation
+    # has no "layer" property (that's a shapes-only property, not valid on
+    # annotations -- this is the fix for the ValueError), so instead this is
+    # a text-only scatter trace added before the team marker traces below --
+    # Plotly draws traces in the order they're added, so this one ends up
+    # underneath. "Good pitching" is the low-FIP- half, which renders at the
+    # TOP once the y-axis is reversed below -- labels are placed by data
+    # value, not by screen position, so this still comes out visually correct.
     quadrant_labels = [
         (100 - x_half / 2, 100 - y_half / 2, "Bad Hitting, Good Pitching"),
         (100 + x_half / 2, 100 - y_half / 2, "Good Hitting, Good Pitching"),
         (100 - x_half / 2, 100 + y_half / 2, "Bad Hitting, Bad Pitching"),
         (100 + x_half / 2, 100 + y_half / 2, "Good Hitting, Bad Pitching"),
     ]
-    for qx, qy, label in quadrant_labels:
-        fig.add_annotation(
-            x=qx, y=qy, text=label,
-            showarrow=False,
-            font=dict(size=13, color="rgba(150,150,150,0.45)", family=FONT_FAMILY),
-            layer="below",
-        )
+    fig.add_trace(go.Scatter(
+        x=[q[0] for q in quadrant_labels],
+        y=[q[1] for q in quadrant_labels],
+        mode="text",
+        text=[q[2] for q in quadrant_labels],
+        textfont=dict(size=13, color="rgba(150,150,150,0.45)", family=FONT_FAMILY),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
 
     for _, row in df.iterrows():
         team_id = int(row["team_id"])
