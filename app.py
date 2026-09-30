@@ -555,13 +555,42 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     The y-axis is reversed so "up" always means "better" in both dimensions
     (lower FIP- is actually better pitching, same convention as ERA-) --
     without the reversal, the top-right corner would misleadingly mix a good
-    result (high wRC+) with a bad one (high FIP-). Dashed lines mark the
-    100 = league-average point on each axis."""
+    result (high wRC+) with a bad one (high FIP-). Axis ranges are forced
+    symmetric around 100 on each axis, so the league-average point (100, 100)
+    always sits at the visual center of the plot rather than wherever the
+    data's own min/max happen to place it."""
     df = df.dropna(subset=["wrc_plus", "fip_minus", "team_id"]).copy()
     if df.empty:
         return None
 
+    # Symmetric ranges: how far the data strays from 100 in the worst
+    # direction on each axis becomes the half-width/half-height on both
+    # sides, so 100 lands exactly in the middle either way.
+    x_half = max((df["wrc_plus"] - 100).abs().max(), 1) * 1.15
+    y_half = max((df["fip_minus"] - 100).abs().max(), 1) * 1.15
+    x_range = [100 - x_half, 100 + x_half]
+    y_range = [100 - y_half, 100 + y_half]  # smaller FIP- (better) at the low end
+
     fig = go.Figure()
+
+    # Subtle quadrant labels, drawn behind the markers (layer="below").
+    # "Good pitching" is the low-FIP- half, which renders at the TOP once the
+    # y-axis is reversed below -- labels are placed by data value, not by
+    # screen position, so this still comes out visually correct.
+    quadrant_labels = [
+        (100 - x_half / 2, 100 - y_half / 2, "Bad Hitting, Good Pitching"),
+        (100 + x_half / 2, 100 - y_half / 2, "Good Hitting, Good Pitching"),
+        (100 - x_half / 2, 100 + y_half / 2, "Bad Hitting, Bad Pitching"),
+        (100 + x_half / 2, 100 + y_half / 2, "Good Hitting, Bad Pitching"),
+    ]
+    for qx, qy, label in quadrant_labels:
+        fig.add_annotation(
+            x=qx, y=qy, text=label,
+            showarrow=False,
+            font=dict(size=13, color="rgba(150,150,150,0.45)", family=FONT_FAMILY),
+            layer="below",
+        )
+
     for _, row in df.iterrows():
         team_id = int(row["team_id"])
         color = TEAM_ID_TO_COLOR.get(team_id, "#1f77b4")
@@ -586,8 +615,8 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         height=650,
         margin=dict(l=70, r=40, t=30, b=60),
         font=dict(family=FONT_FAMILY),
-        xaxis=dict(title="wRC+  (100 = league average, higher is better)", fixedrange=True),
-        yaxis=dict(title="FIP-  (100 = league average, lower is better)", autorange="reversed", fixedrange=True),
+        xaxis=dict(title="wRC+  (100 = league average, higher is better)", range=x_range, fixedrange=True),
+        yaxis=dict(title="FIP-  (100 = league average, lower is better)", range=y_range[::-1], fixedrange=True),
         dragmode=False,
         hoverlabel=dict(font=dict(family=FONT_FAMILY)),
         plot_bgcolor="rgba(0,0,0,0)",
