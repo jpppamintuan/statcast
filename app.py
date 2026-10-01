@@ -25,8 +25,21 @@ st.set_page_config(page_title="Statcast Leaderboard", layout="wide")
 SOURCES = {
     "batting": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&leverage=Neutral&group=Batter&type=All&sub_type=null&min=1&csv=true",
     "pitching": "https://baseballsavant.mlb.com/leaderboard/swing-take?year={year}&team=&group=Pitcher&type=All&sub_type=null&min=q&csv=true",
-    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?gameType=Regular&seasonStart={year}&seasonEnd={year}&type=fielder&position=0&minInnings=q&minResults=1&csv=true",
+    "fielding": "https://baseballsavant.mlb.com/leaderboard/fielding-run-value?gameType=Regular&seasonStart={year}&seasonEnd={year}&type=fielder&position={position}&minInnings=q&minResults=1&csv=true",
     "baserunning": "https://baseballsavant.mlb.com/leaderboard/baserunning-run-value?season_start={year}&season_end={year}&csv=true",
+}
+
+# Fielding-position filter for the Total RV table. These numeric codes match
+# Savant's own fielding-run-value leaderboard, confirmed live: C/1B/2B/3B/SS
+# match the standard baseball scorekeeping numbers (2-6), which Savant's
+# filter panel also exposes as individual options; LF/CF/RF (7/8/9) follow
+# the same convention but weren't independently confirmed as raw values (the
+# live page only showed label text, not the underlying codes) -- worth a
+# quick check against the debug panel's row counts once deployed. There's no
+# position code for pitchers or DH; both are outside what this filter can
+# isolate, which is why "All" stays the default.
+POSITION_OPTIONS = {
+    "All": 0, "C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6, "LF": 7, "CF": 8, "RF": 9,
 }
 
 # Candidate column names Savant has used for the run-value figure, player
@@ -348,19 +361,30 @@ def get_last_name(full_name: str) -> str:
 # reruns when the underlying CSVs actually change (i.e. after a cache clear),
 # not on every Streamlit rerun (sorting, resizing, other widget interactions).
 @st.cache_data(ttl=None, show_spinner=False)
-def build_leaderboard(year: int):
+def build_leaderboard(year: int, fielding_position: int = 0):
+    """fielding_position is a row FILTER, not a recalculation: Batting/Pitching/
+    Fielding/Baserunning RV columns stay each player's season totals as always.
+    When fielding_position != 0, the table is restricted to just the players
+    who show up on Savant's fielding-run-value leaderboard at that position --
+    pure pitchers and pure DH never appear there, so they fall out of the
+    filtered view (there's no position code for either)."""
     frames = {}
     debug_info = {}
+    fielding_player_ids = None
     for category, url_template in SOURCES.items():
-        url = url_template.format(year=year)
+        url = url_template.format(year=year, position=fielding_position)
         try:
             raw = fetch_csv(url)
             norm, debug = normalize(raw, category)
             frames[category] = norm
             debug_info[category] = {"status": "ok", "url": url, **debug}
+            if category == "fielding":
+                fielding_player_ids = set(norm["player_id"].dropna())
         except Exception as e:
             frames[category] = pd.DataFrame(columns=["player_id", "player_name", "team_id", f"{category}_rv"])
             debug_info[category] = {"status": f"error: {e}", "url": url}
+            if category == "fielding":
+                fielding_player_ids = set()
 
     combined = None
     for category, df in frames.items():
@@ -389,6 +413,12 @@ def build_leaderboard(year: int):
     combined["team_logo"] = combined["team_id"].apply(
         lambda t: TEAM_LOGO_URL.format(team_id=int(t)) if pd.notna(t) else None
     )
+
+    # The actual position-filter step: everyone else (pure pitchers, pure DH,
+    # and position players who didn't play this one) is excluded entirely,
+    # not just blanked out -- a real row filter, not a recalculation.
+    if fielding_position != 0 and fielding_player_ids is not None:
+        combined = combined[combined["player_id"].isin(fielding_player_ids)]
 
     combined = combined.sort_values("total_run_value", ascending=False).reset_index(drop=True)
     combined.index += 1
@@ -995,9 +1025,6 @@ with col1:
     if st.button("🔄 Force refresh now"):
         st.cache_data.clear()
 
-with st.spinner("Pulling live data from Baseball Savant..."):
-    leaderboard, debug_info = build_leaderboard(int(year))
-
 if "view" not in st.session_state:
     st.session_state.view = "total_rv"
 
@@ -1025,9 +1052,21 @@ with btn_col3:
         st.rerun()
 
 if st.session_state.view == "total_rv":
+    pos_col, _ = st.columns([1, 3])
+    with pos_col:
+        position_label = st.selectbox("Filter by position", options=list(POSITION_OPTIONS.keys()), index=0)
+    fielding_position = POSITION_OPTIONS[position_label]
+
+    with st.spinner("Pulling live data from Baseball Savant..."):
+        leaderboard, debug_info = build_leaderboard(int(year), fielding_position)
+
     st.caption(
         "Live from Baseball Savant. Total Run Value = Batting + Pitching + Fielding + "
-        "Baserunning run value, summed per player."
+        "Baserunning run value, summed per player. The position filter restricts "
+        "*which players* appear (anyone who played that position per Savant's fielding "
+        "leaderboard) -- it doesn't recompute the RV columns, which stay each player's "
+        "full-season totals. Pure pitchers and pure DH can't be isolated this way, since "
+        "Savant has no position code for either."
     )
 
     display_cols = ["player_name", "team_logo", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
@@ -1132,7 +1171,7 @@ elif st.session_state.view == "starting_pitchers":
     else:
         st.info("No pitcher data available for this season/selection yet.")
 
-    debug_to_show = {**debug_info, **pitchers_debug}
+    debug_to_show = pitchers_debug
 
 else:
     with st.spinner("Pulling live team data from MLB Stats API..."):
