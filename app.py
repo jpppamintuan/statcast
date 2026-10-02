@@ -29,17 +29,40 @@ SOURCES = {
     "baserunning": "https://baseballsavant.mlb.com/leaderboard/baserunning-run-value?season_start={year}&season_end={year}&csv=true",
 }
 
-# Fielding-position filter for the Total RV table. These numeric codes match
-# Savant's own fielding-run-value leaderboard, confirmed live: C/1B/2B/3B/SS
-# match the standard baseball scorekeeping numbers (2-6), which Savant's
-# filter panel also exposes as individual options; LF/CF/RF (7/8/9) follow
+# Position/role filter for the Total RV table. Each entry says (a) what
+# "position" value to request from Savant's fielding-run-value leaderboard
+# (only meaningful for actual fielding positions) and (b) which fetched
+# source's player list to use as the row filter.
+#
+# C/1B/2B/3B/SS match the standard baseball scorekeeping numbers (2-6),
+# confirmed live against Savant's own filter panel; LF/CF/RF (7/8/9) follow
 # the same convention but weren't independently confirmed as raw values (the
 # live page only showed label text, not the underlying codes) -- worth a
-# quick check against the debug panel's row counts once deployed. There's no
-# position code for pitchers or DH; both are outside what this filter can
-# isolate, which is why "All" stays the default.
+# quick check against the debug panel's row counts once deployed.
+#
+# "Pitcher" is NOT a fielding-position code on Savant (there isn't one), so
+# it's handled differently: filtered by presence on the PITCHING source
+# instead of the fielding one. This is deliberately an inclusive filter
+# ("has a pitching RV entry") rather than an exclusionary one ("has no
+# batting/fielding/baserunning entry") specifically so two-way players still
+# show up under "Pitcher" -- excluding them just because they also hit would
+# be wrong. The pitching source's own min=q (qualified) threshold already
+# screens out token/mop-up position-player-pitching appearances, so this
+# doesn't need extra filtering to avoid false positives from that.
+#
+# There's still no way to isolate a pure DH this way -- DH has no fielding
+# code and no pitching record, so nothing distinguishes it from "didn't play."
 POSITION_OPTIONS = {
-    "All": 0, "C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6, "LF": 7, "CF": 8, "RF": 9,
+    "All": {"fielding_position": 0, "filter_source": None},
+    "C": {"fielding_position": 2, "filter_source": "fielding"},
+    "1B": {"fielding_position": 3, "filter_source": "fielding"},
+    "2B": {"fielding_position": 4, "filter_source": "fielding"},
+    "3B": {"fielding_position": 5, "filter_source": "fielding"},
+    "SS": {"fielding_position": 6, "filter_source": "fielding"},
+    "LF": {"fielding_position": 7, "filter_source": "fielding"},
+    "CF": {"fielding_position": 8, "filter_source": "fielding"},
+    "RF": {"fielding_position": 9, "filter_source": "fielding"},
+    "Pitcher": {"fielding_position": 0, "filter_source": "pitching"},
 }
 
 # Candidate column names Savant has used for the run-value figure, player
@@ -197,6 +220,16 @@ DIVISIONS = {
     "NL East": ["ATL", "MIA", "NYM", "PHI", "WSH"],
     "NL Central": ["CHC", "CIN", "MIL", "PIT", "STL"],
     "NL West": ["ARI", "COL", "LAD", "SD", "SF"],
+}
+
+# Reverse lookup (abbreviation -> team_id) and a team_id -> league ("AL"/"NL")
+# map, both derived from TEAM_ID_TO_ABBR/DIVISIONS above rather than
+# maintained separately, for the Total RV table's team/league filters.
+ABBR_TO_TEAM_ID = {abbr: team_id for team_id, abbr in TEAM_ID_TO_ABBR.items()}
+TEAM_ID_TO_LEAGUE = {
+    ABBR_TO_TEAM_ID[abbr]: ("AL" if division.startswith("AL") else "NL")
+    for division, abbrs in DIVISIONS.items()
+    for abbr in abbrs
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StatcastLeaderboardApp/1.0)"}
@@ -361,16 +394,23 @@ def get_last_name(full_name: str) -> str:
 # reruns when the underlying CSVs actually change (i.e. after a cache clear),
 # not on every Streamlit rerun (sorting, resizing, other widget interactions).
 @st.cache_data(ttl=None, show_spinner=False)
-def build_leaderboard(year: int, fielding_position: int = 0):
-    """fielding_position is a row FILTER, not a recalculation: Batting/Pitching/
-    Fielding/Baserunning RV columns stay each player's season totals as always.
-    When fielding_position != 0, the table is restricted to just the players
-    who show up on Savant's fielding-run-value leaderboard at that position --
-    pure pitchers and pure DH never appear there, so they fall out of the
-    filtered view (there's no position code for either)."""
+def build_leaderboard(year: int, position_filter: str = "All"):
+    """position_filter is a row FILTER, not a recalculation: Batting/Pitching/
+    Fielding/Baserunning RV columns stay each player's season totals as
+    always. For an actual fielding position, the table is restricted to
+    players who show up on Savant's fielding-run-value leaderboard at that
+    position. For "Pitcher", it's restricted to players present on the
+    pitching RV source instead (see POSITION_OPTIONS for why this is
+    deliberately inclusive rather than exclusionary). "All" applies no filter.
+    Pure DH can't be isolated either way -- no fielding code, no pitching
+    record, nothing to filter on."""
+    position_config = POSITION_OPTIONS.get(position_filter, POSITION_OPTIONS["All"])
+    fielding_position = position_config["fielding_position"]
+    filter_source = position_config["filter_source"]
+
     frames = {}
     debug_info = {}
-    fielding_player_ids = None
+    source_player_ids = {}
     for category, url_template in SOURCES.items():
         url = url_template.format(year=year, position=fielding_position)
         try:
@@ -378,13 +418,11 @@ def build_leaderboard(year: int, fielding_position: int = 0):
             norm, debug = normalize(raw, category)
             frames[category] = norm
             debug_info[category] = {"status": "ok", "url": url, **debug}
-            if category == "fielding":
-                fielding_player_ids = set(norm["player_id"].dropna())
+            source_player_ids[category] = set(norm["player_id"].dropna())
         except Exception as e:
             frames[category] = pd.DataFrame(columns=["player_id", "player_name", "team_id", f"{category}_rv"])
             debug_info[category] = {"status": f"error: {e}", "url": url}
-            if category == "fielding":
-                fielding_player_ids = set()
+            source_player_ids[category] = set()
 
     combined = None
     for category, df in frames.items():
@@ -414,11 +452,11 @@ def build_leaderboard(year: int, fielding_position: int = 0):
         lambda t: TEAM_LOGO_URL.format(team_id=int(t)) if pd.notna(t) else None
     )
 
-    # The actual position-filter step: everyone else (pure pitchers, pure DH,
-    # and position players who didn't play this one) is excluded entirely,
-    # not just blanked out -- a real row filter, not a recalculation.
-    if fielding_position != 0 and fielding_player_ids is not None:
-        combined = combined[combined["player_id"].isin(fielding_player_ids)]
+    # The actual position/role-filter step: everyone outside the matching
+    # source's player list is excluded entirely, not just blanked out -- a
+    # real row filter, not a recalculation.
+    if filter_source is not None:
+        combined = combined[combined["player_id"].isin(source_player_ids.get(filter_source, set()))]
 
     combined = combined.sort_values("total_run_value", ascending=False).reset_index(drop=True)
     combined.index += 1
@@ -1052,21 +1090,38 @@ with btn_col3:
         st.rerun()
 
 if st.session_state.view == "total_rv":
-    pos_col, _ = st.columns([1, 3])
+    pos_col, team_col, league_col, _ = st.columns([1, 1, 1, 2])
     with pos_col:
         position_label = st.selectbox("Filter by position", options=list(POSITION_OPTIONS.keys()), index=0)
-    fielding_position = POSITION_OPTIONS[position_label]
+    with team_col:
+        team_options = ["All"] + sorted(ABBR_TO_TEAM_ID.keys())
+        team_label = st.selectbox("Filter by team", options=team_options, index=0)
+    with league_col:
+        league_label = st.selectbox("Filter by league", options=["All", "AL", "NL"], index=0)
 
     with st.spinner("Pulling live data from Baseball Savant..."):
-        leaderboard, debug_info = build_leaderboard(int(year), fielding_position)
+        leaderboard, debug_info = build_leaderboard(int(year), position_label)
+
+    # Team/league are plain filters on the already-fetched table -- unlike
+    # the position filter, neither changes what's requested from Savant, so
+    # there's no need to involve build_leaderboard's caching for these.
+    if team_label != "All":
+        leaderboard = leaderboard[leaderboard["team_id"] == ABBR_TO_TEAM_ID[team_label]]
+    if league_label != "All":
+        leaderboard = leaderboard[leaderboard["team_id"].map(TEAM_ID_TO_LEAGUE) == league_label]
+    # Re-rank 1..N for whatever subset is actually being shown, rather than
+    # leaving gaps from the pre-filter rank (e.g. 3, 7, 15...).
+    leaderboard = leaderboard.sort_values("total_run_value", ascending=False).reset_index(drop=True)
+    leaderboard.index += 1
 
     st.caption(
         "Live from Baseball Savant. Total Run Value = Batting + Pitching + Fielding + "
-        "Baserunning run value, summed per player. The position filter restricts "
-        "*which players* appear (anyone who played that position per Savant's fielding "
-        "leaderboard) -- it doesn't recompute the RV columns, which stay each player's "
-        "full-season totals. Pure pitchers and pure DH can't be isolated this way, since "
-        "Savant has no position code for either."
+        "Baserunning run value, summed per player. Position/team/league are row filters "
+        "on *which players* appear -- they don't recompute the RV columns, which stay "
+        "each player's full-season totals. \"Pitcher\" includes two-way players (anyone "
+        "with a pitching RV entry, not just players with no batting/fielding/baserunning "
+        "entry) so it doesn't wrongly exclude them. Pure DH can't be isolated by any of "
+        "these filters, since there's no fielding code or pitching record to catch it on."
     )
 
     display_cols = ["player_name", "team_logo", "batting_rv", "pitching_rv", "fielding_rv", "baserunning_rv", "total_run_value"]
