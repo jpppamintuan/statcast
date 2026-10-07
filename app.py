@@ -122,6 +122,11 @@ TEAM_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/teams/stats?stats=sabermet
 # Fallback if the team-level sabermetrics stat type above doesn't exist:
 # pull it per player (confirmed to work) and aggregate wRAA by team ourselves.
 PLAYER_HITTING_SABERMETRICS_URL = MLB_STATSAPI_BASE + "/stats?stats=sabermetrics&group=hitting&season={year}&sportId=1&playerPool=all&limit=2000"
+# Player-level pitching component stats, for the rotation-vs-bullpen FIP-
+# scatter: this single source gives both the FIP inputs (HR/BB/HBP/K/IP) AND
+# gamesStarted for role classification, so there's no need to cross-reference
+# Savant's GS source and risk a player_id mismatch between the two systems.
+PLAYER_PITCHING_SEASON_URL = MLB_STATSAPI_BASE + "/stats?stats=season&group=pitching&season={year}&sportId=1&playerPool=all&limit=3000"
 
 # Candidate JSON field names per stat -- MLB Stats API field names are fairly
 # stable, but this hasn't been live-tested from this environment (no network
@@ -143,6 +148,7 @@ STATSAPI_FIELD_CANDIDATES = {
     # season record, NOT the sum of individual pitchers' win/loss decisions.
     "wins": ["wins"],
     "losses": ["losses"],
+    "games_started": ["gamesStarted"],
 }
 
 # Team fielding run value -- from Savant's own CSV export, same mechanism as
@@ -661,6 +667,133 @@ def build_team_performance_data(year: int):
     return combined, debug_info
 
 
+@st.cache_data(ttl=None, show_spinner=False)
+def build_rotation_bullpen_fip_data(year: int):
+    """Per-team average FIP- for starters vs. relievers -- a different
+    computation from build_team_performance_data's team-level FIP-: here
+    FIP- is computed per PITCHER first (from that pitcher's own component
+    stats), classified Starter/Reliever, then averaged within each group per
+    team. The league FIP constant/ERA used to index each pitcher's FIP- is
+    recomputed independently here from team totals (small amount of
+    duplicated arithmetic vs. build_team_performance_data, not a duplicated
+    network call, since the underlying fetch is itself cached) rather than
+    threading a shared value between the two functions, to keep this feature
+    self-contained and avoid touching the already-working first chart."""
+    debug_info = {}
+
+    # League FIP constant + league ERA (same formula as build_team_performance_data).
+    try:
+        payload = fetch_json(TEAM_PITCHING_SEASON_URL.format(year=year))
+        splits = extract_team_splits(payload)
+        rows = []
+        for split in splits:
+            stat = split.get("stat", {})
+            rows.append({
+                "hr_allowed": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hr_allowed"]),
+                "bb": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["bb"]),
+                "hbp": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hbp"]),
+                "so": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["so"]),
+                "ip": parse_innings_pitched(pick_stat(stat, STATSAPI_FIELD_CANDIDATES["ip"])),
+                "earned_runs": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["earned_runs"]),
+            })
+        league_df = pd.DataFrame(rows)
+        for c in ["hr_allowed", "bb", "hbp", "so", "ip", "earned_runs"]:
+            league_df[c] = pd.to_numeric(league_df[c], errors="coerce")
+        league_hr, league_bb = league_df["hr_allowed"].sum(), league_df["bb"].sum()
+        league_hbp, league_so = league_df["hbp"].sum(), league_df["so"].sum()
+        league_ip, league_er = league_df["ip"].sum(), league_df["earned_runs"].sum()
+        league_era = 9 * league_er / league_ip if league_ip else None
+        fip_constant = (
+            league_era - (13 * league_hr + 3 * (league_bb + league_hbp) - 2 * league_so) / league_ip
+            if (league_era is not None and league_ip) else None
+        )
+        debug_info["league_pitching_totals"] = {
+            "status": "ok", "league_era": league_era, "fip_constant": fip_constant,
+        }
+    except Exception as e:
+        league_era = fip_constant = None
+        debug_info["league_pitching_totals"] = {"status": f"error: {e}"}
+
+    if league_era is None or fip_constant is None:
+        return pd.DataFrame(), debug_info
+
+    # Per-pitcher component stats + gamesStarted, all from one source.
+    player_rows = []
+    try:
+        payload = fetch_json(PLAYER_PITCHING_SEASON_URL.format(year=year))
+        splits = extract_team_splits(payload)
+        for split in splits:
+            player = split.get("player", {})
+            team = split.get("team", {})
+            stat = split.get("stat", {})
+            player_rows.append({
+                "player_id": player.get("id"),
+                "team_id": team.get("id"),
+                "hr_allowed": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hr_allowed"]),
+                "bb": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["bb"]),
+                "hbp": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["hbp"]),
+                "so": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["so"]),
+                "ip": parse_innings_pitched(pick_stat(stat, STATSAPI_FIELD_CANDIDATES["ip"])),
+                "gs": pick_stat(stat, STATSAPI_FIELD_CANDIDATES["games_started"]),
+            })
+        debug_info["player_pitching_season"] = {
+            "status": "ok", "url": PLAYER_PITCHING_SEASON_URL.format(year=year),
+            "players_found": len(splits),
+            "sample_stat_keys": list(splits[0]["stat"].keys()) if splits else [],
+        }
+    except Exception as e:
+        debug_info["player_pitching_season"] = {"status": f"error: {e}", "url": PLAYER_PITCHING_SEASON_URL.format(year=year)}
+
+    player_df = pd.DataFrame(player_rows)
+    if player_df.empty:
+        return pd.DataFrame(), debug_info
+    for c in ["hr_allowed", "bb", "hbp", "so", "ip", "gs"]:
+        player_df[c] = pd.to_numeric(player_df[c], errors="coerce")
+    player_df = player_df.dropna(subset=["team_id", "ip"])
+
+    # Role classification -- same thresholds as the Pitchers tab.
+    league_max_gs = player_df["gs"].max()
+    if pd.isna(league_max_gs) or league_max_gs <= 0:
+        return pd.DataFrame(), debug_info
+    min_gs_threshold = math.ceil(MIN_GS_PCT_OF_MAX * league_max_gs)
+
+    def classify(row):
+        if row["gs"] >= min_gs_threshold:
+            return "starter"
+        if row["ip"] >= MIN_RELIEVER_IP:
+            return "reliever"
+        return None
+
+    player_df["role"] = player_df.apply(classify, axis=1)
+    player_df = player_df.dropna(subset=["role"])
+
+    # Per-pitcher FIP-, indexed against the league constant computed above.
+    def pitcher_fip_minus(row):
+        if not row["ip"]:
+            return None
+        fip = (13 * row["hr_allowed"] + 3 * (row["bb"] + row["hbp"]) - 2 * row["so"]) / row["ip"] + fip_constant
+        return (fip / league_era) * 100
+
+    player_df["fip_minus"] = player_df.apply(pitcher_fip_minus, axis=1)
+    player_df = player_df.dropna(subset=["fip_minus"])
+
+    # Average FIP- (and pitcher count, for transparency in the tooltip) by team + role.
+    grouped = player_df.groupby(["team_id", "role"]).agg(
+        avg_fip_minus=("fip_minus", "mean"),
+        pitcher_count=("fip_minus", "count"),
+    ).reset_index()
+
+    fip_pivot = grouped.pivot(index="team_id", columns="role", values="avg_fip_minus")
+    count_pivot = grouped.pivot(index="team_id", columns="role", values="pitcher_count")
+    fip_pivot = fip_pivot.rename(columns={"starter": "starter_fip_minus", "reliever": "reliever_fip_minus"})
+    count_pivot = count_pivot.rename(columns={"starter": "starter_count", "reliever": "reliever_count"})
+    result = fip_pivot.join(count_pivot).reset_index()
+    result["team_abbr"] = result["team_id"].apply(
+        lambda t: TEAM_ID_TO_ABBR.get(int(t), str(int(t))) if pd.notna(t) else None
+    )
+    return result, debug_info
+
+
 def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     """One point per team: wRC+ on x (higher = better hitting), FIP- on y.
     The y-axis is reversed so "up" always means "better" in both dimensions
@@ -833,6 +966,90 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
             title=dict(text="Wins", font=dict(size=10, family=FONT_FAMILY)),
             font=dict(size=9, family=FONT_FAMILY),
         ),
+    )
+    return fig
+
+
+def build_rotation_bullpen_chart(df: pd.DataFrame) -> go.Figure | None:
+    """x = a team's starters' average FIP-, y = its relievers' average FIP-
+    (each individually computed per pitcher, then averaged within role --
+    not the team-level FIP- from the chart above). Both axes are reversed
+    here, not just one: lower FIP- is better for BOTH roles (unlike the
+    wRC+/FIP- chart, where one axis points up and the other down), so
+    reversing both keeps "up and to the right = good team" consistent with
+    the first chart. Centered at (100, 100) the same way, for the same
+    reason -- so league-average sits in the middle regardless of the data's
+    own spread."""
+    df = df.dropna(subset=["starter_fip_minus", "reliever_fip_minus", "team_id"]).copy()
+    if df.empty:
+        return None
+
+    x_half = max((df["starter_fip_minus"] - 100).abs().max(), 1) * 1.15
+    y_half = max((df["reliever_fip_minus"] - 100).abs().max(), 1) * 1.15
+    x_range = [100 - x_half, 100 + x_half]
+    y_range = [100 - y_half, 100 + y_half]
+
+    fig = go.Figure()
+
+    # Subtle quadrant labels behind the markers -- same technique as the
+    # chart above (text-only trace added first, so later traces draw over
+    # it; go.layout.Annotation has no "layer" property to do this directly).
+    quadrant_labels = [
+        (100 - x_half / 2, 100 - y_half / 2, "Good Rotation, Good Bullpen"),
+        (100 + x_half / 2, 100 - y_half / 2, "Bad Rotation, Good Bullpen"),
+        (100 - x_half / 2, 100 + y_half / 2, "Good Rotation, Bad Bullpen"),
+        (100 + x_half / 2, 100 + y_half / 2, "Bad Rotation, Bad Bullpen"),
+    ]
+    fig.add_trace(go.Scatter(
+        x=[q[0] for q in quadrant_labels],
+        y=[q[1] for q in quadrant_labels],
+        mode="text",
+        text=[q[2] for q in quadrant_labels],
+        textfont=dict(size=13, color="rgba(150,150,150,0.45)", family=FONT_FAMILY),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    if "starter_count" not in df.columns:
+        df["starter_count"] = None
+    if "reliever_count" not in df.columns:
+        df["reliever_count"] = None
+
+    marker_colors = df["team_id"].apply(lambda t: TEAM_ID_TO_COLOR.get(int(t), "#1f77b4"))
+    customdata = df[["team_abbr", "starter_fip_minus", "reliever_fip_minus", "starter_count", "reliever_count"]].values
+    fig.add_trace(go.Scatter(
+        x=df["starter_fip_minus"], y=df["reliever_fip_minus"],
+        mode="markers+text",
+        text=df["team_abbr"],
+        textposition="top center",
+        textfont=dict(size=11, family=FONT_FAMILY, color="black"),
+        marker=dict(size=16, color=marker_colors, line=dict(color="white", width=1)),
+        customdata=customdata,
+        hovertemplate=(
+            "%{customdata[0]}<br>Starters' avg FIP-: %{customdata[1]:.0f} (n=%{customdata[3]:.0f})"
+            "<br>Relievers' avg FIP-: %{customdata[2]:.0f} (n=%{customdata[4]:.0f})<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+
+    fig.add_vline(x=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
+    fig.add_hline(y=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
+
+    fig.update_layout(
+        height=650,
+        margin=dict(l=70, r=40, t=30, b=70),
+        font=dict(family=FONT_FAMILY),
+        xaxis=dict(
+            title="Starters' avg FIP- (100 = league average)<br>→ better rotation",
+            range=x_range[::-1], fixedrange=True,
+        ),
+        yaxis=dict(
+            title="Relievers' avg FIP- (100 = league average)<br>↑ better bullpen",
+            range=y_range[::-1], fixedrange=True,
+        ),
+        dragmode=False,
+        hoverlabel=dict(font=dict(family=FONT_FAMILY)),
+        plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
@@ -1251,7 +1468,29 @@ else:
     else:
         st.info("No team performance data available for this season yet.")
 
-    debug_to_show = team_perf_debug
+    st.divider()
+    st.subheader("Rotation vs. Bullpen")
+    with st.spinner("Pulling live per-pitcher data from MLB Stats API..."):
+        rotation_bullpen_df, rotation_bullpen_debug = build_rotation_bullpen_fip_data(int(year))
+
+    st.caption(
+        "Each team's starters' average FIP- (x-axis) vs. its relievers' average "
+        "FIP- (y-axis) -- computed per pitcher first (from that pitcher's own "
+        "component stats), then averaged within role, not the team-level FIP- "
+        "from the chart above. Starter/reliever uses the same rule as the "
+        "Pitchers tab (GS at least 10% of the league's highest GS = starter; "
+        "below that with 16.2+ IP = reliever). Pitcher counts behind each "
+        "average are in the tooltip -- worth a glance for teams where a role "
+        "only has a couple of qualifying arms, since small samples swing the "
+        "average more."
+    )
+    rotation_bullpen_chart = build_rotation_bullpen_chart(rotation_bullpen_df)
+    if rotation_bullpen_chart is not None:
+        render_scrollable_chart(rotation_bullpen_chart)
+    else:
+        st.info("No rotation/bullpen data available for this season yet.")
+
+    debug_to_show = {**team_perf_debug, **rotation_bullpen_debug}
 
 with st.expander("🔧 Debug: raw source status & column mapping (check this if numbers look off)"):
     for category, info in debug_to_show.items():
