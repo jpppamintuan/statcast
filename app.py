@@ -669,16 +669,22 @@ def build_team_performance_data(year: int):
 
 @st.cache_data(ttl=None, show_spinner=False)
 def build_rotation_bullpen_fip_data(year: int):
-    """Per-team average FIP- for starters vs. relievers -- a different
-    computation from build_team_performance_data's team-level FIP-: here
-    FIP- is computed per PITCHER first (from that pitcher's own component
-    stats), classified Starter/Reliever, then averaged within each group per
-    team. The league FIP constant/ERA used to index each pitcher's FIP- is
-    recomputed independently here from team totals (small amount of
-    duplicated arithmetic vs. build_team_performance_data, not a duplicated
-    network call, since the underlying fetch is itself cached) rather than
-    threading a shared value between the two functions, to keep this feature
-    self-contained and avoid touching the already-working first chart."""
+    """Per-team FIP- for starters vs. relievers -- a different computation
+    from build_team_performance_data's team-level FIP-: here, pitchers are
+    first classified Starter/Reliever individually, then each team+role
+    group's RAW FIP COMPONENTS (HR/BB/HBP/K/IP) are SUMMED before computing
+    one FIP- for the group -- not an unweighted average of each pitcher's own
+    FIP-. This matters: summing components first is mathematically identical
+    to weighting each pitcher's FIP- by his innings pitched (since a weighted
+    mean of (numerator_i/IP_i) by IP_i reduces to sum(numerator_i)/sum(IP_i)),
+    so a 16-inning reliever's one bad outing can't swing the group average as
+    much as a 180-inning workhorse's full season. The league FIP constant/ERA
+    used to index each group's FIP- is recomputed independently here from
+    team totals (small amount of duplicated arithmetic vs.
+    build_team_performance_data, not a duplicated network call, since the
+    underlying fetch is itself cached) rather than threading a shared value
+    between the two functions, to keep this feature self-contained and avoid
+    touching the already-working first chart."""
     debug_info = {}
 
     # League FIP constant + league ERA (same formula as build_team_performance_data).
@@ -767,23 +773,29 @@ def build_rotation_bullpen_fip_data(year: int):
     player_df["role"] = player_df.apply(classify, axis=1)
     player_df = player_df.dropna(subset=["role"])
 
-    # Per-pitcher FIP-, indexed against the league constant computed above.
-    def pitcher_fip_minus(row):
+    # Sum raw FIP components within each team+role group FIRST (IP-weighted
+    # result -- see function docstring), then compute one FIP-/group from
+    # those sums, rather than averaging each pitcher's individually-computed
+    # FIP-.
+    grouped = player_df.groupby(["team_id", "role"]).agg(
+        hr_allowed=("hr_allowed", "sum"),
+        bb=("bb", "sum"),
+        hbp=("hbp", "sum"),
+        so=("so", "sum"),
+        ip=("ip", "sum"),
+        pitcher_count=("player_id", "count"),
+    ).reset_index()
+
+    def group_fip_minus(row):
         if not row["ip"]:
             return None
         fip = (13 * row["hr_allowed"] + 3 * (row["bb"] + row["hbp"]) - 2 * row["so"]) / row["ip"] + fip_constant
         return (fip / league_era) * 100
 
-    player_df["fip_minus"] = player_df.apply(pitcher_fip_minus, axis=1)
-    player_df = player_df.dropna(subset=["fip_minus"])
+    grouped["fip_minus"] = grouped.apply(group_fip_minus, axis=1)
+    grouped = grouped.dropna(subset=["fip_minus"])
 
-    # Average FIP- (and pitcher count, for transparency in the tooltip) by team + role.
-    grouped = player_df.groupby(["team_id", "role"]).agg(
-        avg_fip_minus=("fip_minus", "mean"),
-        pitcher_count=("fip_minus", "count"),
-    ).reset_index()
-
-    fip_pivot = grouped.pivot(index="team_id", columns="role", values="avg_fip_minus")
+    fip_pivot = grouped.pivot(index="team_id", columns="role", values="fip_minus")
     count_pivot = grouped.pivot(index="team_id", columns="role", values="pitcher_count")
     fip_pivot = fip_pivot.rename(columns={"starter": "starter_fip_minus", "reliever": "reliever_fip_minus"})
     count_pivot = count_pivot.rename(columns={"starter": "starter_count", "reliever": "reliever_count"})
@@ -826,11 +838,6 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
     x_range = [100 - x_half, 100 + x_half]
     y_range = [100 - y_half, 100 + y_half]  # smaller FIP- (better) at the low end
 
-    fielding_vals = df["fielding_rv"].fillna(0) if "fielding_rv" in df.columns else pd.Series(0, index=df.index)
-    fielding_max_abs = fielding_vals.abs().max()
-    if pd.isna(fielding_max_abs) or not fielding_max_abs:
-        fielding_max_abs = 1
-
     DIVERGING_COLORSCALE = [
         [0.0, "rgb(31,119,180)"],   # most negative -- blue
         [0.5, "rgb(225,225,225)"],  # zero -- neutral gray
@@ -858,6 +865,15 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         marker_sizes = df["wins"].apply(size_for_wins)
     else:
         marker_sizes = pd.Series(MAX_MARKER_SIZE / 2, index=df.index)
+
+    # fielding_vals is computed AFTER the sort above (not before) -- it must
+    # read from the same row order as x/y/text/customdata below, or Plotly
+    # aligns color-to-point purely by array position and every team ends up
+    # wearing some other team's fielding color. That was the actual bug.
+    fielding_vals = df["fielding_rv"].fillna(0) if "fielding_rv" in df.columns else pd.Series(0, index=df.index)
+    fielding_max_abs = fielding_vals.abs().max()
+    if pd.isna(fielding_max_abs) or not fielding_max_abs:
+        fielding_max_abs = 1
 
     fig = go.Figure()
 
@@ -925,21 +941,20 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         showlegend=False,
     ))
 
-    # Bubble-size legend for wins, placed beside the colorbar. Plotly has no
-    # native "size legend" the way it has colorbar for color, so this is the
-    # standard workaround: invisible off-chart points (x=None), one per
-    # reference win total, shown only for their legend entry.
+    # Text-based legend for wins, beside the colorbar. The earlier version
+    # used reference circles of different sizes (the standard Plotly
+    # workaround for a "size legend," since there's no native one the way
+    # there's a native colorbar for color) -- dropped because two moderately
+    # different win totals (e.g. 80 vs. 103) just don't read as distinguishable
+    # circle sizes at a glance. Plain numbers are unambiguous instead.
     if has_wins:
-        legend_win_values = sorted(set(round(v) for v in [win_min, (win_min + win_max) / 2, win_max]))
-        for wv in legend_win_values:
-            fig.add_trace(go.Scatter(
-                x=[None], y=[None],
-                mode="markers",
-                marker=dict(size=size_for_wins(wv), color="rgba(160,160,160,0.6)", line=dict(color="white", width=1)),
-                name=f"{wv} wins",
-                showlegend=True,
-                hoverinfo="skip",
-            ))
+        fig.add_annotation(
+            xref="paper", yref="paper",
+            x=0.98, y=-0.16, xanchor="right", yanchor="top",
+            text=f"Point size = Wins (range: {int(win_min)}\u2013{int(win_max)})",
+            showarrow=False,
+            font=dict(size=10, color="rgba(100,100,100,0.9)", family=FONT_FAMILY),
+        )
 
     fig.add_vline(x=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
     fig.add_hline(y=100, line_dash="dash", line_color="rgba(150,150,150,0.5)")
@@ -959,13 +974,6 @@ def build_team_performance_chart(df: pd.DataFrame) -> go.Figure | None:
         dragmode=False,
         hoverlabel=dict(font=dict(family=FONT_FAMILY)),
         plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(
-            orientation="h",
-            x=0.62, xanchor="left",
-            y=-0.16, yanchor="top",
-            title=dict(text="Wins", font=dict(size=10, family=FONT_FAMILY)),
-            font=dict(size=9, family=FONT_FAMILY),
-        ),
     )
     return fig
 
@@ -1283,7 +1291,7 @@ with col1:
 if "view" not in st.session_state:
     st.session_state.view = "total_rv"
 
-btn_col1, btn_col2, btn_col3, _ = st.columns([1, 1, 1, 3])
+btn_col1, btn_col2, btn_col3, btn_col4, _ = st.columns([1, 1, 1, 1, 2])
 with btn_col1:
     if st.button(
         "Total RV", use_container_width=True,
@@ -1304,6 +1312,13 @@ with btn_col3:
         type="primary" if st.session_state.view == "team_performance" else "secondary",
     ):
         st.session_state.view = "team_performance"
+        st.rerun()
+with btn_col4:
+    if st.button(
+        "Team Pitching", use_container_width=True,
+        type="primary" if st.session_state.view == "team_pitching" else "secondary",
+    ):
+        st.session_state.view = "team_pitching"
         st.rerun()
 
 if st.session_state.view == "total_rv":
@@ -1445,7 +1460,7 @@ elif st.session_state.view == "starting_pitchers":
 
     debug_to_show = pitchers_debug
 
-else:
+elif st.session_state.view == "team_performance":
     with st.spinner("Pulling live team data from MLB Stats API..."):
         team_perf_df, team_perf_debug = build_team_performance_data(int(year))
 
@@ -1458,9 +1473,10 @@ else:
         "run value (from Baseball Savant) is a third dimension, shown as marker color: "
         "red = above-average fielding, blue = below-average, gray = league average, "
         "scaled relative to the other 29 teams (see the colorbar below the chart). "
-        "Wins are a fourth dimension, shown as marker size (see the Wins legend to "
-        "its right) -- the team's actual season win total, not a sum of individual "
-        "pitchers' decisions. Full win-loss record is in the tooltip."
+        "Wins are a fourth dimension, shown as marker size -- the team's actual season "
+        "win total, not a sum of individual pitchers' decisions (see the text legend "
+        "next to the colorbar for the size-to-wins range). Full win-loss record is in "
+        "the tooltip."
     )
     team_perf_chart = build_team_performance_chart(team_perf_df)
     if team_perf_chart is not None:
@@ -1468,21 +1484,24 @@ else:
     else:
         st.info("No team performance data available for this season yet.")
 
-    st.divider()
+    debug_to_show = team_perf_debug
+
+else:
     st.subheader("Rotation vs. Bullpen")
     with st.spinner("Pulling live per-pitcher data from MLB Stats API..."):
         rotation_bullpen_df, rotation_bullpen_debug = build_rotation_bullpen_fip_data(int(year))
 
     st.caption(
-        "Each team's starters' average FIP- (x-axis) vs. its relievers' average "
-        "FIP- (y-axis) -- computed per pitcher first (from that pitcher's own "
-        "component stats), then averaged within role, not the team-level FIP- "
-        "from the chart above. Starter/reliever uses the same rule as the "
-        "Pitchers tab (GS at least 10% of the league's highest GS = starter; "
-        "below that with 16.2+ IP = reliever). Pitcher counts behind each "
-        "average are in the tooltip -- worth a glance for teams where a role "
-        "only has a couple of qualifying arms, since small samples swing the "
-        "average more."
+        "Each team's starters' FIP- (x-axis) vs. its relievers' FIP- (y-axis) -- a "
+        "different number from the team-level FIP- on the Team Performance tab. "
+        "Pitchers are classified Starter/Reliever first (same rule as the Pitchers "
+        "tab: GS at least 10% of the league's highest GS = starter; below that with "
+        "16.2+ IP = reliever), then each team+role group's raw FIP components are "
+        "summed before computing one FIP- for the group -- mathematically the same "
+        "as weighting each pitcher's FIP- by his innings pitched, so a reliever with "
+        "just a handful of innings can't swing the number as much as a workhorse's "
+        "full season. Pitcher counts behind each number are in the tooltip -- worth "
+        "a glance for teams where a role only has a couple of qualifying arms."
     )
     rotation_bullpen_chart = build_rotation_bullpen_chart(rotation_bullpen_df)
     if rotation_bullpen_chart is not None:
@@ -1490,7 +1509,7 @@ else:
     else:
         st.info("No rotation/bullpen data available for this season yet.")
 
-    debug_to_show = {**team_perf_debug, **rotation_bullpen_debug}
+    debug_to_show = rotation_bullpen_debug
 
 with st.expander("🔧 Debug: raw source status & column mapping (check this if numbers look off)"):
     for category, info in debug_to_show.items():
